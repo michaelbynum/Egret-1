@@ -246,22 +246,22 @@ class _ACOPFBranchAndBound(BranchAndBoundAlgorithm):
         return NodeSolution(None, sol)
 
     def _solve_problem_at_node(self, tree, node, is_root):
-        self.logger.debug(f'solving problem at node: {node.coordinate}')
-        self.logger.debug('getting nlp')
+        self.logger.info(f'solving problem at node: {node.coordinate}')
+        self.logger.info('getting nlp')
         nlp = node.storage.model()
-        self.logger.debug('starting fbbt')
+        self.logger.info('starting fbbt')
         new_bounds = fbbt(nlp, max_iter=2, feasibility_tol=1e-6)
-        self.logger.debug('updating bounds')
+        self.logger.info('updating bounds')
         node.storage.update_bounds(bounds=new_bounds)
-        self.logger.debug('solving upper bounding problem')
+        self.logger.info('solving upper bounding problem')
         ub, nlp_sol = self._ub_solve(nlp)
-        self.logger.debug('getting relaxation')
+        self.logger.info('getting relaxation')
         relaxation = node.storage.model_relaxation()
-        self.logger.debug('initial solve of relaxation')
+        self.logger.info('initial solve of relaxation')
         lb, rel_sol = self._lb_solve(relaxation)
-        self.logger.debug(f'node LB: {lb};    node UB: {ub}')
+        self.logger.info(f'node LB: {lb};    node UB: {ub}')
         if lb < tree.upper_bound - self.galini.mc.epsilon:
-            self.logger.debug('starting DBT')
+            self.logger.info('starting DBT')
             dbt_info = coramin.domain_reduction.perform_dbt(relaxation=relaxation,
                                                             solver=self._acopf_config.obbt_solver,
                                                             time_limit=self.galini.timelimit.seconds_left(),
@@ -270,25 +270,25 @@ class _ACOPFBranchAndBound(BranchAndBoundAlgorithm):
                                                             feasibility_tol=1e-8,
                                                             safety_tol=1e-4,
                                                             with_progress_bar=False)
-            self.logger.debug(str(dbt_info))
-            self.logger.debug('updating bounds')
+            self.logger.info(str(dbt_info))
+            self.logger.info('updating bounds')
             new_bounds = pe.ComponentMap()
             for v in coramin.relaxations.nonrelaxation_component_data_objects(relaxation, pe.Var, active=True, descend_into=True):
                 nlp_v = node.storage.relaxation_to_model_var_map[v]
                 new_bounds[nlp_v] = (v.lb, v.ub)
             node.storage.update_bounds(bounds=new_bounds)
-            self.logger.debug('getting updated relaxation')
+            self.logger.info('getting updated relaxation')
             relaxation = node.storage.model_relaxation()
-            self.logger.debug('resolving relaxation')
+            self.logger.info('resolving relaxation')
             lb, rel_sol = self._lb_solve(relaxation)
-            self.logger.debug(f'node LB: {lb};    node UB: {ub}')
+            self.logger.info(f'node LB: {lb};    node UB: {ub}')
         else:
-            self.logger.debug('lower bound is large enough; bounds tightening is not needed.')
+            self.logger.info('lower bound is large enough; bounds tightening is not needed.')
         if math.isfinite(lb):
             weights = {'sum': self.bab_config['branching_weight_sum'],
                        'max': self.bab_config['branching_weight_max'],
                        'min': self.bab_config['branching_weight_min']}
-            self.logger.debug('computing branching decision')
+            self.logger.info('computing branching decision')
             bd = compute_branching_decision(model=nlp,
                                             linear_model=relaxation,
                                             root_bounds=node.tree.root.storage.model_bounds,
