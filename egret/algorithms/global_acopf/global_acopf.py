@@ -22,7 +22,9 @@ from galini.pyomo import safe_setlb, safe_setub
 from galini.branch_and_bound.branching import branch_at_point
 from mpi4py import MPI
 from pyomo.common.collections.component_set import ComponentSet
-import warnings
+from galini.quantities import relative_gap
+from galini.branch_and_bound.tree import BabTree
+from galini.branch_and_bound.node import Node
 
 
 comm: MPI.Comm = MPI.COMM_WORLD
@@ -50,6 +52,9 @@ class GlobalACOPFConfig(ConfigDict):
         self.relative_gap = self.declare('relative_gap', ConfigValue(default=1e-3, domain=PositiveFloat))
         self.obbt_solver = self.declare('obbt_solver', ConfigValue())
         self.log_level = self.declare('log_level', ConfigValue(default=25, domain=NonNegativeInt))
+        self.root_dbt_max_iter = self.declare('root_dbt_max_iter', ConfigValue(default=3, domain=NonNegativeInt))
+        self.node_dbt_max_iter = self.declare('node_dbt_max_iter', ConfigValue(default=1, domain=NonNegativeInt))
+        self.dbt_improvement_tol = self.declare('dbt_improvement_tol', ConfigValue(default=1e-3, domain=PositiveFloat))
 
 
 def _get_galini(config: GlobalACOPFConfig):
@@ -245,7 +250,7 @@ class _ACOPFBranchAndBound(BranchAndBoundAlgorithm):
         ub, sol = self._ub_solve(model)
         return NodeSolution(None, sol)
 
-    def _solve_problem_at_node(self, tree, node, is_root):
+    def _solve_problem_at_node(self, tree: BabTree, node: Node, is_root):
         self.logger.info(f'solving problem at node: {node.coordinate}')
         self.logger.info('getting nlp')
         nlp = node.storage.model()
@@ -260,28 +265,38 @@ class _ACOPFBranchAndBound(BranchAndBoundAlgorithm):
         self.logger.info('initial solve of relaxation')
         lb, rel_sol = self._lb_solve(relaxation)
         self.logger.info(f'node LB: {lb};    node UB: {ub}')
-        if lb < tree.upper_bound - self.galini.mc.epsilon:
-            self.logger.info('starting DBT')
-            dbt_info = coramin.domain_reduction.perform_dbt(relaxation=relaxation,
-                                                            solver=self._acopf_config.obbt_solver,
-                                                            time_limit=self.galini.timelimit.seconds_left(),
-                                                            objective_bound=tree.upper_bound,
-                                                            parallel=True,
-                                                            feasibility_tol=1e-8,
-                                                            safety_tol=1e-4,
-                                                            with_progress_bar=False)
-            self.logger.info(str(dbt_info))
-            self.logger.info('updating bounds')
-            new_bounds = pe.ComponentMap()
-            for v in coramin.relaxations.nonrelaxation_component_data_objects(relaxation, pe.Var, active=True, descend_into=True):
-                nlp_v = node.storage.relaxation_to_model_var_map[v]
-                new_bounds[nlp_v] = (v.lb, v.ub)
-            node.storage.update_bounds(bounds=new_bounds)
-            self.logger.info('getting updated relaxation')
-            relaxation = node.storage.model_relaxation()
-            self.logger.info('resolving relaxation')
-            lb, rel_sol = self._lb_solve(relaxation)
-            self.logger.info(f'node LB: {lb};    node UB: {ub}')
+        if relative_gap(lb, tree.upper_bound, self.galini.mc) > self.bab_config['relative_gap']:
+            if is_root:
+                max_dbt_iter = self._acopf_config.root_dbt_max_iter
+            else:
+                max_dbt_iter = self._acopf_config.node_dbt_max_iter
+            for _dbt_iter in range(max_dbt_iter):
+                last_lb = lb
+                self.logger.info('starting DBT')
+                dbt_info = coramin.domain_reduction.perform_dbt(relaxation=relaxation,
+                                                                solver=self._acopf_config.obbt_solver,
+                                                                time_limit=self.galini.timelimit.seconds_left(),
+                                                                objective_bound=tree.upper_bound,
+                                                                parallel=True,
+                                                                feasibility_tol=1e-8,
+                                                                safety_tol=1e-4,
+                                                                with_progress_bar=False)
+                self.logger.info(str(dbt_info))
+                self.logger.info('updating bounds')
+                new_bounds = pe.ComponentMap()
+                for v in coramin.relaxations.nonrelaxation_component_data_objects(relaxation, pe.Var, active=True, descend_into=True):
+                    nlp_v = node.storage.relaxation_to_model_var_map[v]
+                    new_bounds[nlp_v] = (v.lb, v.ub)
+                node.storage.update_bounds(bounds=new_bounds)
+                self.logger.info('getting updated relaxation')
+                relaxation = node.storage.model_relaxation()
+                self.logger.info('resolving relaxation')
+                lb, rel_sol = self._lb_solve(relaxation)
+                self.logger.info(f'node LB: {lb};    node UB: {ub}')
+                last_rel_gap = relative_gap(last_lb, tree.upper_bound, self.galini.mc)
+                rel_gap = relative_gap(lb, tree.upper_bound, self.galini.mc)
+                if last_rel_gap - rel_gap <= self._acopf_config.dbt_improvement_tol:
+                    break
         else:
             self.logger.info('lower bound is large enough; bounds tightening is not needed.')
         if math.isfinite(lb):
