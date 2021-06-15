@@ -3,7 +3,7 @@ from egret.models.ac_relaxations import create_atan_relaxation
 import pyomo.environ as pe
 from galini.galini import Galini
 from galini.branch_and_bound.algorithm import BranchAndBoundAlgorithm
-from pyomo.common.config import ConfigDict, ConfigValue, NonNegativeFloat, PositiveFloat
+from pyomo.common.config import ConfigDict, ConfigValue, NonNegativeFloat, PositiveFloat, NonNegativeInt
 from pyomo.solvers.plugins.solvers.persistent_solver import PersistentSolver
 from egret.data.model_data import ModelData
 import itertools
@@ -22,11 +22,12 @@ from galini.pyomo import safe_setlb, safe_setub
 from galini.branch_and_bound.branching import branch_at_point
 from mpi4py import MPI
 from pyomo.common.collections.component_set import ComponentSet
+import warnings
 
 
 comm: MPI.Comm = MPI.COMM_WORLD
 rank = comm.Get_rank()
-logger = logging.getLogger(__name__)
+logger = logging.getLogger('gacopf')
 
 
 class GlobalACOPFConfig(ConfigDict):
@@ -48,6 +49,7 @@ class GlobalACOPFConfig(ConfigDict):
         self.absolute_gap = self.declare('absolute_gap', ConfigValue(default=1e-4, domain=PositiveFloat))
         self.relative_gap = self.declare('relative_gap', ConfigValue(default=1e-3, domain=PositiveFloat))
         self.obbt_solver = self.declare('obbt_solver', ConfigValue())
+        self.log_level = self.declare('log_level', ConfigValue(default=25, domain=NonNegativeInt))
 
 
 def _get_galini(config: GlobalACOPFConfig):
@@ -56,7 +58,11 @@ def _get_galini(config: GlobalACOPFConfig):
     galini.get_configuration_group('branch_and_cut')['bab'].set('absolute_gap', config.absolute_gap)
     galini.get_configuration_group('branch_and_cut')['bab'].set('relative_gap', config.relative_gap)
     if rank == 0:
-        galini._log_manager.apply_config(galini.get_configuration_group('logging'))
+        galini.get_configuration_group('logging').set('level', config.log_level)
+    else:
+        galini.get_configuration_group('logging').set('level', logging.WARNING)
+        galini.get_configuration_group('logging').set('stdout', False)
+    galini._log_manager.apply_config(galini.get_configuration_group('logging'))
     galini.acopf_config = config
     return galini
 
@@ -240,22 +246,22 @@ class _ACOPFBranchAndBound(BranchAndBoundAlgorithm):
         return NodeSolution(None, sol)
 
     def _solve_problem_at_node(self, tree, node, is_root):
-        logger.info(f'solving problem at node: {node}')
-        logger.info('getting nlp')
+        self.logger.debug(f'solving problem at node: {node.coordinate}')
+        self.logger.debug('getting nlp')
         nlp = node.storage.model()
-        logger.info('starting fbbt')
+        self.logger.debug('starting fbbt')
         new_bounds = fbbt(nlp, max_iter=2, feasibility_tol=1e-6)
-        logger.info('updating bounds')
+        self.logger.debug('updating bounds')
         node.storage.update_bounds(bounds=new_bounds)
-        logger.info('solving upper bounding problem')
+        self.logger.debug('solving upper bounding problem')
         ub, nlp_sol = self._ub_solve(nlp)
-        logger.info('getting relaxation')
+        self.logger.debug('getting relaxation')
         relaxation = node.storage.model_relaxation()
-        logger.info('initial solve of relaxation')
+        self.logger.debug('initial solve of relaxation')
         lb, rel_sol = self._lb_solve(relaxation)
-        logger.info(f'node LB: {lb};    node UB: {ub}')
+        self.logger.debug(f'node LB: {lb};    node UB: {ub}')
         if lb < tree.upper_bound - self.galini.mc.epsilon:
-            logger.info('starting DBT')
+            self.logger.debug('starting DBT')
             dbt_info = coramin.domain_reduction.perform_dbt(relaxation=relaxation,
                                                             solver=self._acopf_config.obbt_solver,
                                                             time_limit=self.galini.timelimit.seconds_left(),
@@ -263,26 +269,26 @@ class _ACOPFBranchAndBound(BranchAndBoundAlgorithm):
                                                             parallel=True,
                                                             feasibility_tol=1e-8,
                                                             safety_tol=1e-4,
-                                                            with_progress_bar=True)
-            logger.info(str(dbt_info))
-            logger.info('updating bounds')
+                                                            with_progress_bar=False)
+            self.logger.debug(str(dbt_info))
+            self.logger.debug('updating bounds')
             new_bounds = pe.ComponentMap()
             for v in coramin.relaxations.nonrelaxation_component_data_objects(relaxation, pe.Var, active=True, descend_into=True):
                 nlp_v = node.storage.relaxation_to_model_var_map[v]
                 new_bounds[nlp_v] = (v.lb, v.ub)
             node.storage.update_bounds(bounds=new_bounds)
-            logger.info('getting updated relaxation')
+            self.logger.debug('getting updated relaxation')
             relaxation = node.storage.model_relaxation()
-            logger.info('resolving relaxation')
+            self.logger.debug('resolving relaxation')
             lb, rel_sol = self._lb_solve(relaxation)
-            logger.info(f'node LB: {lb};    node UB: {ub}')
+            self.logger.debug(f'node LB: {lb};    node UB: {ub}')
         else:
-            logger.info('lower bound is large enough; bounds tightening is not needed.')
+            self.logger.debug('lower bound is large enough; bounds tightening is not needed.')
         if math.isfinite(lb):
             weights = {'sum': self.bab_config['branching_weight_sum'],
                        'max': self.bab_config['branching_weight_max'],
                        'min': self.bab_config['branching_weight_min']}
-            logger.info('computing branching decision')
+            self.logger.debug('computing branching decision')
             bd = compute_branching_decision(model=nlp,
                                             linear_model=relaxation,
                                             root_bounds=node.tree.root.storage.model_bounds,
@@ -340,8 +346,8 @@ def solve_global_acopf(md: ModelData, config: GlobalACOPFConfig):
         if isinstance(b, coramin.relaxations.PWArctanRelaxationData):
             b.use_linear_relaxation = True
             arctan_count += 1
-    print(f'arctan count: {arctan_count}')
-    print(f'# nonlinear vars: {len(all_nonlinear_vars)}')
+    logger.info(f'arctan count: {arctan_count}')
+    logger.info(f'# nonlinear vars: {len(all_nonlinear_vars)}')
     # _multivariate_oa(m)
     galini = _get_galini(config)
     logger.info('solving')
