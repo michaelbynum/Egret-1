@@ -17,13 +17,23 @@ import egret.model_library.transmission.tx_calc as tx_calc
 import egret.model_library.decl as decl
 from egret.model_library.defn import FlowType, CoordinateType, ApproximationType, RelaxationType
 from egret.data.data_utils import zip_items
+from egret.data.model_data import ModelData
 from pyomo.core.util import quicksum
 from pyomo.core.expr.numeric_expr import LinearExpression
 from collections import OrderedDict
 from pyomo.contrib.fbbt.fbbt import fbbt
+from pyomo.core.base.block import _BlockData
+from pyomo.core.base.set import _SetData
+from typing import Mapping, Optional, Sequence
+from .tx_utils import get_unique_bus_pairs
+from egret.data.networkx_utils import get_networkx_graph
 import warnings
+import networkx
 import logging
+from math import pi
 from typing import List, Tuple, AbstractSet
+from pyomo.contrib.fbbt import interval
+from pyomo.common.collections.orderedset import OrderedSet
 try:
     import coramin
     coramin_available = True
@@ -34,11 +44,105 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
-def declare_var_dva(model, index_set, **kwargs):
+def _get_bus_to_branch_map(md: ModelData):
+    bus_to_branch_map = dict()
+    for bname, branch in md.data['elements']['branch'].items():
+        from_bus = branch['from_bus']
+        to_bus = branch['to_bus']
+        if (from_bus, to_bus) not in bus_to_branch_map:
+            bus_to_branch_map[from_bus, to_bus] = bname
+    return bus_to_branch_map
+
+
+def declare_set_unique_bus_pairs(
+        m: _BlockData,
+        md: ModelData,
+):
+    unique_bus_pairs = get_unique_bus_pairs(md)
+    for fb, tb in unique_bus_pairs:
+        assert (tb, fb) not in unique_bus_pairs
+    m.unique_bus_pairs = pe.Set(initialize=unique_bus_pairs)
+
+
+def declare_set_cycle_basis_bus_pairs(
+        m: _BlockData,
+        md: ModelData,
+) -> List[List]:
+    graph = get_networkx_graph(md)
+    ref_bus = md.data['system']['reference_bus']
+    cycle_basis = networkx.algorithms.cycle_basis(graph, root=ref_bus)
+
+    cycle_basis_bus_pairs = OrderedSet()
+    for cycle in cycle_basis:
+        for ndx in range(len(cycle) - 1):
+            b1 = cycle[ndx]
+            b2 = cycle[ndx + 1]
+            assert (b1, b2) in m.unique_bus_pairs or (b2, b1) in m.unique_bus_pairs
+            if (b1, b2) in m.unique_bus_pairs:
+                cycle_basis_bus_pairs.add((b1, b2))
+            else:
+                cycle_basis_bus_pairs.add((b2, b1))
+        b1 = cycle[-1]
+        b2 = cycle[0]
+        assert (b1, b2) in m.unique_bus_pairs or (b2, b1) in m.unique_bus_pairs
+        if (b1, b2) in m.unique_bus_pairs:
+            cycle_basis_bus_pairs.add((b1, b2))
+        else:
+            cycle_basis_bus_pairs.add((b2, b1))
+
+    m.cycle_basis_bus_pairs = pe.Set(initialize=cycle_basis_bus_pairs)
+
+    return cycle_basis
+
+
+def declare_set_branch_set(
+        m: _BlockData,
+        md: ModelData,
+):
+    branches = list(md.data['elements']['branch'].keys())
+    m.branch_set = pe.Set(initialize=branches)
+
+
+def declare_expression_branch_in_service_expr(
+        m: _BlockData,
+        md: ModelData,
+        index_set: _SetData,
+        rule: Optional[str] = 'default'
+):
+    if rule not in {'default', None}:
+        raise ValueError("rule should be either 'default' or None")
+
+    m.branch_in_service_expr = pe.Expression(index_set)
+
+    if rule == 'default':
+        for b in index_set:
+            branch = md.data['elements']['branch'][b]
+            if branch['in_service']:
+                m.branch_in_service_expr[b] = 1
+            else:
+                m.branch_in_service_expr[b] = 0
+
+
+def declare_var_dva(
+        model: _BlockData,
+        md: ModelData,
+        index_set: _SetData,
+        add_bounds: bool = True,
+):
     """
     Create variable or the angle difference between interconnected bus pairs
     """
-    decl.declare_var('dva', model=model, index_set=index_set, **kwargs)
+    model.dva = pe.Var(index_set, initialize=0)
+
+    if add_bounds:
+        for bname, branch in md.data['elements']['branch'].items():
+            from_bus = branch['from_bus']
+            to_bus = branch['to_bus']
+            if (from_bus, to_bus) in index_set:
+                angle_min = max(-math.pi/2, math.radians(branch['angle_diff_min']))
+                angle_max = min(math.pi/2, math.radians(branch['angle_diff_max']))
+                model.dva.setlb(angle_min)
+                model.dva.setub(angle_max)
 
 
 def declare_var_pfl(model, index_set, **kwargs):
@@ -49,12 +153,88 @@ def declare_var_pfl(model, index_set, **kwargs):
     decl.declare_var('pfl', model=model, index_set=index_set, **kwargs)
 
 
-def declare_var_pf(model, index_set, **kwargs):
+def declare_var_pf(
+        model: _BlockData,
+        md: ModelData,
+        index_set:_SetData,
+        add_bounds: bool = True
+):
     """
     Create variable for the real part of the power flow in the "from"
     end of the transmission line
     """
-    decl.declare_var('pf', model=model, index_set=index_set, **kwargs)
+    model.pf = pe.Var(index_set)
+
+    if add_bounds:
+        for bname in index_set:
+            branch = md.data['elements']['branch'][bname]
+            smax = branch['rating_long_term']
+            if smax is not None:
+                model.pf[bname].setlb(-smax)
+                model.pf[bname].setub(smax)
+
+
+def declare_var_pt(
+        model: _BlockData,
+        md: ModelData,
+        index_set:_SetData,
+        add_bounds: bool = True
+):
+    """
+    Create variable for the real part of the power flow in the "to"
+    end of the transmission line
+    """
+    model.pt = pe.Var(index_set)
+
+    if add_bounds:
+        for bname in index_set:
+            branch = md.data['elements']['branch'][bname]
+            smax = branch['rating_long_term']
+            if smax is not None:
+                model.pt[bname].setlb(-smax)
+                model.pt[bname].setub(smax)
+
+
+def declare_var_qf(
+        model: _BlockData,
+        md: ModelData,
+        index_set:_SetData,
+        add_bounds: bool = True
+):
+    """
+    Create variable for the imaginary part of the power flow in the "from"
+    end of the transmission line
+    """
+    model.qf = pe.Var(index_set)
+
+    if add_bounds:
+        for bname in index_set:
+            branch = md.data['elements']['branch'][bname]
+            smax = branch['rating_long_term']
+            if smax is not None:
+                model.qf[bname].setlb(-smax)
+                model.qf[bname].setub(smax)
+
+
+def declare_var_qt(
+        model: _BlockData,
+        md: ModelData,
+        index_set:_SetData,
+        add_bounds: bool = True
+):
+    """
+    Create variable for the imaginary part of the power flow in the "to"
+    end of the transmission line
+    """
+    model.qt = pe.Var(index_set)
+
+    if add_bounds:
+        for bname in index_set:
+            branch = md.data['elements']['branch'][bname]
+            smax = branch['rating_long_term']
+            if smax is not None:
+                model.qt[bname].setlb(-smax)
+                model.qt[bname].setub(smax)
 
 
 def declare_expr_pf(model, index_set, **kwargs):
@@ -110,34 +290,12 @@ def declare_var_pfi_slack_neg(model, index_set, **kwargs):
     """
     decl.declare_var('pfi_slack_neg', model=model, index_set=index_set, **kwargs)
 
+
 def declare_var_dcpf(model, index_set, **kwargs):
     """
     Create the variable for the real power flow through a HVDC line
     """
     decl.declare_var('dcpf', model=model, index_set=index_set, **kwargs)
-
-def declare_var_qf(model, index_set, **kwargs):
-    """
-    Create variable for the imaginary part of the power flow in the "from"
-    end of the transmission line
-    """
-    decl.declare_var('qf', model=model, index_set=index_set, **kwargs)
-
-
-def declare_var_pt(model, index_set, **kwargs):
-    """
-    Create variable for the real part of the power flow in the "to"
-    end of the transmission line
-    """
-    decl.declare_var('pt', model=model, index_set=index_set, **kwargs)
-
-
-def declare_var_qt(model, index_set, **kwargs):
-    """
-    Create variable for the imaginary part of the power flow in the "to"
-    end of the transmission line
-    """
-    decl.declare_var('qt', model=model, index_set=index_set, **kwargs)
 
 
 def declare_var_ifr(model, index_set, **kwargs):
@@ -248,18 +406,110 @@ def declare_expr_s(model, index_set, coordinate_type=CoordinateType.POLAR):
             m.s[(from_bus,to_bus)] = m.vm[from_bus]*m.vm[to_bus]*pe.sin(m.va[from_bus]-m.va[to_bus])
 
 
-def declare_var_c(model, index_set, **kwargs):
+def declare_var_c(
+    model: _BlockData,
+    md: ModelData,
+    index_set: _SetData,
+    add_bounds=True,
+):
     """
     Create an auxiliary variable for vf * vt * cos(theta_f - theta_t)
     """
-    decl.declare_var('c', model=model, index_set=index_set, **kwargs)
+
+    model.c = pe.Var(index_set, initialize=1)
+
+    if add_bounds:
+        for bname in index_set:
+            branch = md.data['elements']['branch'][bname]
+            from_bus_name = branch['from_bus']
+            to_bus_name = branch['to_bus']
+            from_bus = md.data['elements']['bus'][from_bus_name]
+            to_bus = md.data['elements']['bus'][to_bus_name]
+            theta_bounds = (branch['angle_diff_min']*pi/180, branch['angle_diff_max']*pi/180)
+            vf_bounds = (from_bus['v_min'], from_bus['v_max'])
+            vt_bounds = (to_bus['v_min'], to_bus['v_max'])
+            c_bounds = interval.cos(*theta_bounds)
+            c_bounds = interval.mul(*vf_bounds, *c_bounds)
+            c_lb, c_ub = interval.mul(*vt_bounds, *c_bounds)
+            model.c[bname].setlb(c_lb)
+            model.c[bname].setub(c_ub)
 
 
-def declare_var_s(model, index_set, **kwargs):
+def declare_var_s(
+    model: _BlockData,
+    md: ModelData,
+    index_set: _SetData,
+    add_bounds=True,
+):
     """
     Create an auxiliary variable for vf * vt * sin(theta_f - theta_t)
     """
-    decl.declare_var('s', model=model, index_set=index_set, **kwargs)
+
+    model.s = pe.Var(index_set, initialize=0)
+
+    if add_bounds:
+        for bname in index_set:
+            branch = md.data['elements']['branch'][bname]
+            from_bus_name = branch['from_bus']
+            to_bus_name = branch['to_bus']
+            from_bus = md.data['elements']['bus'][from_bus_name]
+            to_bus = md.data['elements']['bus'][to_bus_name]
+            theta_bounds = (branch['angle_diff_min']*pi/180, branch['angle_diff_max']*pi/180)
+            vf_bounds = (from_bus['v_min'], from_bus['v_max'])
+            vt_bounds = (to_bus['v_min'], to_bus['v_max'])
+            s_bounds = interval.sin(*theta_bounds)
+            s_bounds = interval.mul(*vf_bounds, *s_bounds)
+            s_lb, s_ub = interval.mul(*vt_bounds, *s_bounds)
+            model.s[bname].setlb(s_lb)
+            model.s[bname].setub(s_ub)
+
+
+def declare_duplicate_c_cons(
+        model: _BlockData,
+        md: ModelData,
+        branch_set: _SetData,
+):
+    model.duplicate_c_cons = pe.ConstraintList()
+
+    seen_bus_pairs = dict()
+
+    for b in branch_set:
+        branch = md.data['elements']['branch'][b]
+        from_bus = branch['from_bus']
+        to_bus = branch['to_bus']
+
+        if (from_bus, to_bus) in seen_bus_pairs:
+            other_c = seen_bus_pairs[from_bus, to_bus]
+            model.duplicate_c_cons.add(model.c[b] == other_c)
+        elif (to_bus, from_bus) in seen_bus_pairs:
+            other_c = seen_bus_pairs[to_bus, from_bus]
+            model.duplicate_c_cons.add(model.c[b] == other_c)
+        else:
+            seen_bus_pairs[from_bus, to_bus] = model.c[b]
+
+
+def declare_duplicate_s_cons(
+        model: _BlockData,
+        md: ModelData,
+        branch_set: _SetData,
+):
+    model.duplicate_s_cons = pe.ConstraintList()
+
+    seen_bus_pairs = dict()
+
+    for b in branch_set:
+        branch = md.data['elements']['branch'][b]
+        from_bus = branch['from_bus']
+        to_bus = branch['to_bus']
+
+        if (from_bus, to_bus) in seen_bus_pairs:
+            other_s = seen_bus_pairs[from_bus, to_bus]
+            model.duplicate_s_cons.add(model.s[b] == other_s)
+        elif (to_bus, from_bus) in seen_bus_pairs:
+            other_s = seen_bus_pairs[to_bus, from_bus]
+            model.duplicate_s_cons.add(model.s[b] == -other_s)
+        else:
+            seen_bus_pairs[from_bus, to_bus] = model.s[b]
 
 
 def declare_eq_c(model, index_set, coordinate_type=CoordinateType.POLAR):
@@ -282,7 +532,12 @@ def declare_eq_c(model, index_set, coordinate_type=CoordinateType.POLAR):
         raise ValueError('unexpected coordinate_type: {0}'.format(str(coordinate_type)))
 
 
-def declare_eq_s(model, index_set, coordinate_type=CoordinateType.POLAR):
+def declare_eq_s(
+        model: _BlockData,
+        index_set,
+        branches: Mapping[str, Mapping],
+        coordinate_type: CoordinateType = CoordinateType.POLAR
+):
     """
     Create a constraint relating s to the voltages
     """
@@ -291,28 +546,51 @@ def declare_eq_s(model, index_set, coordinate_type=CoordinateType.POLAR):
     m.eq_s = pe.Constraint(con_set)
 
     if coordinate_type == CoordinateType.POLAR:
-        for from_bus, to_bus in con_set:
-            m.eq_s[(from_bus, to_bus)] = (m.s[(from_bus, to_bus)] ==
-                                          m.vm[from_bus] * m.vm[to_bus] * pe.sin(m.dva[(from_bus, to_bus)]))
+        for bname in con_set:
+            branch = branches[bname]
+            from_bus = branch['from_bus']
+            to_bus = branch['to_bus']
+            m.eq_s[bname] = (
+                m.s[bname] == (m.vm[from_bus] *
+                               m.vm[to_bus] *
+                               pe.sin(m.dva[(from_bus, to_bus)]))
+            )
     elif coordinate_type == CoordinateType.RECTANGULAR:
-        for from_bus, to_bus in con_set:
-            m.eq_s[(from_bus, to_bus)] = (m.s[(from_bus, to_bus)] ==
-                                          m.vj[from_bus] * m.vr[to_bus] - m.vr[from_bus] * m.vj[to_bus])
+        for bname in con_set:
+            branch = branches[bname]
+            from_bus = branch['from_bus']
+            to_bus = branch['to_bus']
+            m.eq_s[bname] = (
+                m.s[bname] == (m.vj[from_bus] * m.vr[to_bus] -
+                               m.vr[from_bus] * m.vj[to_bus])
+            )
     else:
         raise ValueError('unexpected coordinate_type: {0}'.format(str(coordinate_type)))
 
 
-def declare_eq_dva_arctan(model, index_set):
+def declare_eq_dva_arctan(
+        model: _BlockData,
+        md: ModelData,
+        index_set: _SetData,
+):
     m = model
-    con_set = decl.declare_set('_con_eq_dva_arctan', model, index_set)
-    m.eq_dva_arctan = pe.Constraint(con_set)
+    m.eq_dva_arctan = pe.Constraint(index_set)
 
-    for from_bus, to_bus in con_set:
-        expr = m.dva[from_bus, to_bus] == pe.atan(m.s[from_bus, to_bus] / m.c[from_bus, to_bus])
+    bus_to_branch_map = _get_bus_to_branch_map(md)
+
+    for from_bus, to_bus in index_set:
+        svar = m.s[bus_to_branch_map[from_bus, to_bus]]
+        cvar = m.c[bus_to_branch_map[from_bus, to_bus]]
+        expr = m.dva[from_bus, to_bus] == pe.atan(svar / cvar)
         m.eq_dva_arctan[from_bus, to_bus] = expr
 
 
-def declare_eq_dva_cycle_sum(model, cycle_basis: List[List], valid_bus_pairs: AbstractSet[Tuple]):
+def declare_eq_dva_cycle_sum(
+        model: _BlockData,
+        md: ModelData,
+        cycle_basis: List[List],
+        valid_bus_pairs: _SetData
+):
     m = model
     m.dva_cycle_sum_set = pe.Set(initialize=list(range(len(cycle_basis))))
     m.eq_dva_cycle_sum = pe.Constraint(m.dva_cycle_sum_set)
@@ -395,89 +673,179 @@ def declare_eq_branch_current(model, index_set, branches, coordinate_type=Coordi
             -(g21 * m.vj[from_bus] - g22 * m.vj[to_bus] + (b21 * m.vr[from_bus] - b22 * m.vr[to_bus]))
 
 
-def declare_eq_branch_power(model, index_set, branches):
+def _get_branch_params(branch: Mapping):
+    g = tx_calc.calculate_conductance(branch)
+    b = tx_calc.calculate_susceptance(branch)
+    bc = branch['charging_susceptance']
+    tau = 1.0
+    shift = 0.0
+
+    if branch['branch_type'] == 'transformer':
+        tau = branch['transformer_tap_ratio']
+        shift = math.radians(branch['transformer_phase_shift'])
+
+    g11 = g / tau ** 2
+    g12 = g * math.cos(shift) / tau
+    g21 = g * math.sin(shift) / tau
+    g22 = g
+
+    b11 = (b + bc / 2) / tau ** 2
+    b12 = b * math.cos(shift) / tau
+    b21 = b * math.sin(shift) / tau
+    b22 = b + bc / 2
+
+    return g11, g12, g21, g22, b11, b12, b21, b22
+
+
+def declare_eq_pf_branch(
+        m: _BlockData,
+        md: ModelData,
+        index_set: _SetData,
+):
+    m.eq_pf_branch = pe.Constraint(index_set)
+    for bname in index_set:
+        branch = md.data['elements']['branch'][bname]
+
+        from_bus = branch['from_bus']
+
+        g11, g12, g21, g22, b11, b12, b21, b22 = _get_branch_params(branch)
+
+        coefs = [g11, b21 - g12, -g21 - b12]
+        vlist = [
+            m.vmsq[from_bus],
+            m.c[bname],
+            m.s[bname],
+        ]
+        expr = LinearExpression(
+            constant=0,
+            linear_coefs=coefs,
+            linear_vars=vlist,
+        )
+        rhs = expr * m.branch_in_service_expr[bname]
+        m.pf[bname].value = pe.value(rhs)
+        m.eq_pf_branch[bname] = m.pf[bname] == rhs
+
+
+def declare_eq_pt_branch(
+        m: _BlockData,
+        md: ModelData,
+        index_set: _SetData,
+):
+    m.eq_pt_branch = pe.Constraint(index_set)
+    for bname in index_set:
+        branch = md.data['elements']['branch'][bname]
+
+        to_bus = branch['to_bus']
+
+        g11, g12, g21, g22, b11, b12, b21, b22 = _get_branch_params(branch)
+
+        coefs = [g22, -g12 - b21, b12 - g21]
+        vlist = [
+            m.vmsq[to_bus],
+            m.c[bname],
+            m.s[bname],
+        ]
+        expr = LinearExpression(
+            constant=0,
+            linear_coefs=coefs,
+            linear_vars=vlist,
+        )
+        rhs = expr * m.branch_in_service_expr[bname]
+        m.pt[bname].value = pe.value(rhs)
+        m.eq_pt_branch[bname] = m.pt[bname] == rhs
+
+
+def declare_eq_qf_branch(
+        m: _BlockData,
+        md: ModelData,
+        index_set: _SetData,
+):
+    m.eq_qf_branch = pe.Constraint(index_set)
+    for bname in index_set:
+        branch = md.data['elements']['branch'][bname]
+
+        from_bus = branch['from_bus']
+
+        g11, g12, g21, g22, b11, b12, b21, b22 = _get_branch_params(branch)
+
+        coefs = [-b11, b12 + g21, b21 - g12]
+        vlist = [
+            m.vmsq[from_bus],
+            m.c[bname],
+            m.s[bname],
+        ]
+        expr = LinearExpression(
+            constant=0,
+            linear_coefs=coefs,
+            linear_vars=vlist,
+        )
+        rhs = expr * m.branch_in_service_expr[bname]
+        m.qf[bname].value = pe.value(rhs)
+        m.eq_qf_branch[bname] = m.qf[bname] == rhs
+
+
+def declare_eq_qt_branch(
+        m: _BlockData,
+        md: ModelData,
+        index_set: _SetData,
+):
+    m.eq_qt_branch = pe.Constraint(index_set)
+    for bname in index_set:
+        branch = md.data['elements']['branch'][bname]
+
+        to_bus = branch['to_bus']
+
+        g11, g12, g21, g22, b11, b12, b21, b22 = _get_branch_params(branch)
+
+        coefs = [-b22, b12 - g21, b21 + g12]
+        vlist = [
+            m.vmsq[to_bus],
+            m.c[bname],
+            m.s[bname],
+        ]
+        expr = LinearExpression(
+            constant=0,
+            linear_coefs=coefs,
+            linear_vars=vlist,
+        )
+        rhs = expr * m.branch_in_service_expr[bname]
+        m.qt[bname].value = pe.value(rhs)
+        m.eq_qt_branch[bname] = m.qt[bname] == rhs
+
+
+def declare_eq_branch_power(
+        model: _BlockData,
+        md: ModelData,
+        index_set: _SetData,
+):
     """
     Create the equality constraints for the real and reactive power
     in the branch
     """
-    m = model
-    con_set = decl.declare_set("_con_eq_branch_power_set", model, index_set)
-
-    m.eq_pf_branch = pe.Constraint(con_set)
-    m.eq_pt_branch = pe.Constraint(con_set)
-    m.eq_qf_branch = pe.Constraint(con_set)
-    m.eq_qt_branch = pe.Constraint(con_set)
-    for branch_name in con_set:
-        branch = branches[branch_name]
-
-        from_bus = branch['from_bus']
-        to_bus = branch['to_bus']
-        vmsq_from_bus = m.vmsq[from_bus]
-        vmsq_to_bus = m.vmsq[to_bus]
-
-        g = tx_calc.calculate_conductance(branch)
-        b = tx_calc.calculate_susceptance(branch)
-        bc = branch['charging_susceptance']
-        tau = 1.0
-        shift = 0.0
-
-        if branch['branch_type'] == 'transformer':
-            tau = branch['transformer_tap_ratio']
-            shift = math.radians(branch['transformer_phase_shift'])
-
-        g11 = g / tau ** 2
-        g12 = g * math.cos(shift) / tau
-        g21 = g * math.sin(shift) / tau
-        g22 = g
-
-        b11 = (b + bc / 2) / tau ** 2
-        b12 = b * math.cos(shift) / tau
-        b21 = b * math.sin(shift) / tau
-        b22 = b + bc / 2
-
-        m.eq_pf_branch[branch_name] = \
-            m.pf[branch_name] == \
-            g11 * vmsq_from_bus - \
-            (g12 * m.c[(from_bus,to_bus)] +
-             g21 * m.s[(from_bus,to_bus)] +
-             b12 * m.s[(from_bus,to_bus)] -
-             b21 * m.c[(from_bus,to_bus)])
-
-        m.eq_pt_branch[branch_name] = \
-            m.pt[branch_name] == \
-            g22 * vmsq_to_bus - \
-            (g12 * m.c[(from_bus,to_bus)] +
-             g21 * m.s[(from_bus,to_bus)] -
-             b12 * m.s[(from_bus,to_bus)] +
-             b21 * m.c[(from_bus,to_bus)])
-
-        m.eq_qf_branch[branch_name] = \
-            m.qf[branch_name] == \
-            -b11 * vmsq_from_bus + \
-            (b12 * m.c[(from_bus,to_bus)] +
-             b21 * m.s[(from_bus,to_bus)] -
-             g12 * m.s[(from_bus,to_bus)] +
-             g21 * m.c[(from_bus,to_bus)])
-
-        m.eq_qt_branch[branch_name] = \
-            m.qt[branch_name] == \
-            -b22 * vmsq_to_bus + \
-            (b12 * m.c[(from_bus,to_bus)] +
-             b21 * m.s[(from_bus,to_bus)] +
-             g12 * m.s[(from_bus,to_bus)] -
-             g21 * m.c[(from_bus,to_bus)])
+    declare_eq_pf_branch(model, md, index_set)
+    declare_eq_pt_branch(model, md, index_set)
+    declare_eq_qf_branch(model, md, index_set)
+    declare_eq_qt_branch(model, md, index_set)
 
 
-def declare_ineq_soc(model, index_set, use_outer_approximation=False):
+def declare_ineq_soc(
+        model: _BlockData,
+        md: ModelData,
+        index_set: _SetData,
+        use_outer_approximation=False
+):
     """
     create the constraint for the second order cone
     """
     m = model
+
+    bus_to_branch_map = _get_bus_to_branch_map(md)
+
     if not use_outer_approximation:
-        con_set = decl.declare_set("_con_ineq_soc", model, index_set)
-        m.ineq_soc = pe.Constraint(con_set)
-        for from_bus, to_bus in con_set:
-            m.ineq_soc[(from_bus, to_bus)] = m.c[from_bus, to_bus] ** 2 + m.s[from_bus, to_bus] ** 2 <= m.vmsq[
+        m.ineq_soc = pe.Constraint(index_set)
+        for from_bus, to_bus in index_set:
+            branch_name = bus_to_branch_map[from_bus, to_bus]
+            m.ineq_soc[(from_bus, to_bus)] = m.c[branch_name] ** 2 + m.s[branch_name] ** 2 <= m.vmsq[
                 from_bus] * m.vmsq[to_bus]
     else:
         if not coramin_available:
@@ -493,33 +861,38 @@ def declare_ineq_soc(model, index_set, use_outer_approximation=False):
         z1 = 0.5 * (vmsq[from_bus] - vmsq[to_bus])
         z2 = 0.5 * (vmsq[from_bus] + vmsq[to_bus]) 
         """
-        con_set = decl.declare_set("_con_ineq_soc", model, index_set)
-        decl.declare_var('_z1', model=model, index_set=con_set)
-        decl.declare_var('_z2', model=model, index_set=con_set)
-        m._eq_z1 = pe.Constraint(con_set)
-        m._eq_z2 = pe.Constraint(con_set)
-        m.ineq_soc_OA = coramin.relaxations.MultivariateRelaxation(con_set)
-        for from_bus, to_bus in con_set:
+        m._z1 = pe.Var(index_set)
+        m._z2 = pe.Var(index_set)
+        m._eq_z1 = pe.Constraint(index_set)
+        m._eq_z2 = pe.Constraint(index_set)
+        m.ineq_soc_OA = coramin.relaxations.MultivariateRelaxation(index_set)
+        for from_bus, to_bus in index_set:
             m._eq_z1[from_bus, to_bus] = m._z1[from_bus, to_bus] == 0.5 * (m.vmsq[from_bus] - m.vmsq[to_bus])
             m._eq_z2[from_bus, to_bus] = m._z2[from_bus, to_bus] == 0.5 * (m.vmsq[from_bus] + m.vmsq[to_bus])
             fbbt(m._eq_z1[from_bus, to_bus])
             fbbt(m._eq_z2[from_bus, to_bus])
+            branch_name = bus_to_branch_map[from_bus, to_bus]
             m.ineq_soc_OA[from_bus, to_bus].build(aux_var=m._z2[from_bus, to_bus],
                                                   shape=coramin.utils.FunctionShape.CONVEX,
-                                                  f_x_expr=(m.c[from_bus, to_bus] ** 2 +
-                                                            m.s[from_bus, to_bus] ** 2 +
+                                                  f_x_expr=(m.c[branch_name] ** 2 +
+                                                            m.s[branch_name] ** 2 +
                                                             m._z1[from_bus, to_bus] ** 2) ** 0.5)
 
 
-def declare_ineq_soc_ub(model, index_set):
+def declare_ineq_soc_ub(
+        model: _BlockData,
+        md: ModelData,
+        index_set: _SetData,
+):
     """
     create the constraint for the second order cone
     """
     m = model
-    con_set = decl.declare_set("_con_ineq_soc_ub", model, index_set)
-    m.ineq_soc_ub = pe.Constraint(con_set)
-    for from_bus, to_bus in con_set:
-        m.ineq_soc_ub[(from_bus, to_bus)] = (m.c[from_bus, to_bus] ** 2 + m.s[from_bus, to_bus] ** 2 >=
+    m.ineq_soc_ub = pe.Constraint(index_set)
+    bus_to_branch_map = _get_bus_to_branch_map(md)
+    for from_bus, to_bus in index_set:
+        branch_name = bus_to_branch_map[from_bus, to_bus]
+        m.ineq_soc_ub[(from_bus, to_bus)] = (m.c[branch_name] ** 2 + m.s[branch_name] ** 2 >=
                                              m.vmsq[from_bus] * m.vmsq[to_bus])
 
 
@@ -861,7 +1234,48 @@ def declare_eq_interface_power_ptdf_approx(model, index_set, PTDF, rel_ptdf_tol=
             m.pfi[interface_name] = expr
 
 
-def declare_ineq_s_branch_thermal_limit(model, index_set,
+def declare_ineq_sf_branch_thermal_limit(
+        model: _BlockData,
+        md: ModelData,
+        index_set: _SetData,
+):
+    m = model
+    m.ineq_sf_branch_thermal_limit = pe.Constraint(index_set)
+
+    for b in index_set:
+        branch = md.data['elements']['branch'][b]
+        smax = branch['rating_long_term']
+        if smax is None:
+            continue
+        m.ineq_sf_branch_thermal_limit[b] = m.pf[b]**2 + m.qf[b]**2 <= smax**2
+
+
+def declare_ineq_st_branch_thermal_limit(
+        model: _BlockData,
+        md: ModelData,
+        index_set: _SetData,
+):
+    m = model
+    m.ineq_st_branch_thermal_limit = pe.Constraint(index_set)
+
+    for b in index_set:
+        branch = md.data['elements']['branch'][b]
+        smax = branch['rating_long_term']
+        if smax is None:
+            continue
+        m.ineq_st_branch_thermal_limit[b] = m.pt[b]**2 + m.qt[b]**2 <= smax**2
+
+
+def declare_ineq_s_branch_thermal_limit(
+        model: _BlockData,
+        md: ModelData,
+        index_set: _SetData,
+):
+    declare_ineq_sf_branch_thermal_limit(model, md, index_set)
+    declare_ineq_st_branch_thermal_limit(model, md, index_set)
+
+
+def declare_ineq_s_branch_current_limit(model, index_set,
                                         branches, s_thermal_limits,
                                         flow_type=FlowType.POWER):
     """
@@ -872,33 +1286,23 @@ def declare_ineq_s_branch_thermal_limit(model, index_set,
     con_set = decl.declare_set('_con_ineq_s_branch_thermal_limit',
                                model=model, index_set=index_set)
 
-    m.ineq_sf_branch_thermal_limit = pe.Constraint(con_set)
-    m.ineq_st_branch_thermal_limit = pe.Constraint(con_set)
+    m.ineq_sf_branch_current_limit = pe.Constraint(con_set)
+    m.ineq_st_branch_current_limit = pe.Constraint(con_set)
 
-    if flow_type == FlowType.CURRENT:
-        for branch_name in con_set:
-            if s_thermal_limits[branch_name] is None:
-                continue
+    assert flow_type == FlowType.CURRENT
 
-            from_bus = branches[branch_name]['from_bus']
-            to_bus = branches[branch_name]['to_bus']
-            m.ineq_sf_branch_thermal_limit[branch_name] = \
-                (m.vr[from_bus] ** 2 + m.vj[from_bus] ** 2) * (m.ifr[branch_name] ** 2 + m.ifj[branch_name] ** 2) \
-                <= s_thermal_limits[branch_name] ** 2
-            m.ineq_st_branch_thermal_limit[branch_name] = \
-                (m.vr[to_bus] ** 2 + m.vj[to_bus] ** 2) * (m.itr[branch_name] ** 2 + m.itj[branch_name] ** 2) \
-                <= s_thermal_limits[branch_name] ** 2
-    elif flow_type == FlowType.POWER:
-        for branch_name in con_set:
-            if s_thermal_limits[branch_name] is None:
-                continue
+    for branch_name in con_set:
+        if s_thermal_limits[branch_name] is None:
+            continue
 
-            m.ineq_sf_branch_thermal_limit[branch_name] = \
-                m.pf[branch_name] ** 2 + m.qf[branch_name] ** 2 \
-                <= s_thermal_limits[branch_name] ** 2
-            m.ineq_st_branch_thermal_limit[branch_name] = \
-                m.pt[branch_name] ** 2 + m.qt[branch_name] ** 2 \
-                <= s_thermal_limits[branch_name] ** 2
+        from_bus = branches[branch_name]['from_bus']
+        to_bus = branches[branch_name]['to_bus']
+        m.ineq_sf_branch_thermal_limit[branch_name] = \
+            (m.vr[from_bus] ** 2 + m.vj[from_bus] ** 2) * (m.ifr[branch_name] ** 2 + m.ifj[branch_name] ** 2) \
+            <= s_thermal_limits[branch_name] ** 2
+        m.ineq_st_branch_thermal_limit[branch_name] = \
+            (m.vr[to_bus] ** 2 + m.vj[to_bus] ** 2) * (m.itr[branch_name] ** 2 + m.itj[branch_name] ** 2) \
+            <= s_thermal_limits[branch_name] ** 2
 
 
 def declare_ineq_p_branch_thermal_lbub(model, index_set,
@@ -1100,37 +1504,76 @@ def declare_ineq_p_contingency_branch_thermal_bounds(model, index_set,
             m.ineq_pf_contingency_branch_thermal_bounds[contingency_name, branch_name] = \
                     generate_thermal_bounds(m.pfc[contingency_name, branch_name], -limit, limit, neg_slack, pos_slack)
 
-def declare_ineq_angle_diff_branch_lbub_c_s(model, index_set, branches):
+
+def declare_ineq_angle_diff_branch_lb_c_s(
+        model: _BlockData,
+        md: ModelData,
+        index_set: _SetData,
+):
     """
     Create the inequality constraints for the angle difference
     bounds between interconnected buses.
     """
     m = model
-    con_set = decl.declare_set('_con_ineq_angle_diff_branch_lbub',
-                               model=model, index_set=index_set)
 
-    m.ineq_angle_diff_branch_lb = pe.Constraint(con_set)
-    m.ineq_angle_diff_branch_ub = pe.Constraint(con_set)
+    m.ineq_angle_diff_branch_lb = clb = pe.Constraint(index_set)
 
-    for branch_name in con_set:
-        from_bus = branches[branch_name]['from_bus']
-        to_bus = branches[branch_name]['to_bus']
+    for bname in index_set:
+        branch = md.data['elements']['branch'][bname]
+        angle_min = math.radians(branch['angle_diff_min'])
 
-        if branches[branch_name]['angle_diff_min'] > -90:
-            if branches[branch_name]['angle_diff_min'] < -89:
-                msg = 'angle difference limits larger than 89 will introduce large coefficients'
-                logger.warning(msg)
-                warnings.warn(msg)
-            m.ineq_angle_diff_branch_lb[branch_name] = (math.tan(math.radians(branches[branch_name]['angle_diff_min'])) *
-                                                        m.c[(from_bus, to_bus)] <= m.s[(from_bus, to_bus)])
-        if branches[branch_name]['angle_diff_max'] < 90:
-            if branches[branch_name]['angle_diff_min'] > 89:
-                msg = 'angle difference limits larger than 89 will introduce large coefficients'
-                logger.warning(msg)
-                warnings.warn(msg)
-            m.ineq_angle_diff_branch_ub[branch_name] = (m.s[(from_bus, to_bus)] <=
-                                                        math.tan(math.radians(branches[branch_name]['angle_diff_max'])) *
-                                                        m.c[(from_bus, to_bus)])
+        if angle_min <= -math.pi/2:
+            continue
+        if angle_min < math.radians(-89):
+            msg = 'angle difference limits larger than 89 degrees will introduce large coefficients'
+            logger.warning(msg)
+            warnings.warn(msg)
+        clb[bname] = (
+                math.tan(angle_min) * m.c[bname] <=
+                m.s[bname] * m.branch_in_service_expr[bname]
+        )
+
+
+def declare_ineq_angle_diff_branch_ub_c_s(
+        model: _BlockData,
+        md: ModelData,
+        index_set: _SetData,
+):
+    """
+    Create the inequality constraints for the angle difference
+    bounds between interconnected buses.
+    """
+    m = model
+
+    m.ineq_angle_diff_branch_ub = cub = pe.Constraint(index_set)
+
+    for bname in index_set:
+        branch = md.data['elements']['branch'][bname]
+        angle_max = math.radians(branch['angle_diff_max'])
+
+        if angle_max >= math.pi/2:
+            continue
+        if angle_max > math.radians(89):
+            msg = 'angle difference limits larger than 89 degrees will introduce large coefficients'
+            logger.warning(msg)
+            warnings.warn(msg)
+        cub[bname] = (
+                m.s[bname] * m.branch_in_service_expr[bname] <=
+                math.tan(angle_max) * m.c[bname]
+        )
+
+
+def declare_ineq_angle_diff_branch_lbub_c_s(
+        model: _BlockData,
+        md: ModelData,
+        index_set: _SetData,
+):
+    """
+    Create the inequality constraints for the angle difference
+    bounds between interconnected buses.
+    """
+    declare_ineq_angle_diff_branch_lb_c_s(model, md, index_set)
+    declare_ineq_angle_diff_branch_ub_c_s(model, md, index_set)
 
 
 def declare_ineq_angle_diff_branch_lbub(model, index_set, branches, coordinate_type=CoordinateType.POLAR):

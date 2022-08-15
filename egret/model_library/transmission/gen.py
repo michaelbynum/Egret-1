@@ -15,20 +15,128 @@ import pyomo.environ as pe
 import egret.model_library.decl as decl
 from egret.model_library.transmission import tx_utils
 from pyomo.core.expr.numeric_expr import LinearExpression
+from pyomo.core.base.block import _BlockData
+from pyomo.core.base.set import _SetData
+from egret.data.model_data import ModelData
+from typing import Optional
 
 
-def declare_var_pg(model, index_set, **kwargs):
-    """
-    Create a variable for the real component of the power at a generator
-    """
-    decl.declare_var('pg', model=model, index_set=index_set, **kwargs)
+def declare_set_gen_set(
+        m: _BlockData,
+        md: ModelData,
+):
+    gens = list(md.data['elements']['generator'].keys())
+    m.gen_set = pe.Set(initialize=gens)
 
 
-def declare_var_qg(model, index_set, **kwargs):
+def declare_expression_gen_in_service_expr(
+        m: _BlockData,
+        md: ModelData,
+        index_set: _SetData,
+        rule: Optional[str] = 'default'
+):
+    if rule not in {'default', None}:
+        raise ValueError("rule should be either 'default' or None")
+
+    m.gen_in_service_expr = pe.Expression(index_set)
+
+    if rule == 'default':
+        for g in index_set:
+            gen = md.data['elements']['generator'][g]
+            if gen['in_service']:
+                m.gen_in_service_expr[g] = 1
+            else:
+                m.gen_in_service_expr[g] = 0
+
+
+def declare_var_pg(
+        model: _BlockData,
+        md: ModelData,
+        index_set: _SetData,
+        add_bounds: bool = True,
+):
     """
-    Create a variable for the reactive component of the power at a generator
+    Create auxiliary variable for the voltage magnitude squared at a bus
     """
-    decl.declare_var('qg', model=model, index_set=index_set, **kwargs)
+    model.pg = pe.Var(index_set)
+
+    for gname in index_set:
+        gen = md.data['elements']['generator'][gname]
+        pmin = gen['p_min']
+        pmax = gen['p_max']
+        if add_bounds:
+            model.pg[gname].setlb(pmin)
+            model.pg[gname].setub(pmax)
+        model.pg[gname].value = 0.5 * (pmin + pmax)
+
+
+def declare_var_qg(
+        model: _BlockData,
+        md: ModelData,
+        index_set: _SetData,
+        add_bounds: bool = True,
+):
+    """
+    Create auxiliary variable for the voltage magnitude squared at a bus
+    """
+    model.qg = pe.Var(index_set)
+
+    for gname in index_set:
+        gen = md.data['elements']['generator'][gname]
+        qmin = gen['q_min']
+        qmax = gen['q_max']
+        if add_bounds:
+            model.qg[gname].setlb(qmin)
+            model.qg[gname].setub(qmax)
+        model.qg[gname].value = 0.5 * (qmin + qmax)
+
+
+def declare_ineq_pg_lb(
+        m: _BlockData,
+        md: ModelData,
+        index_set: _SetData,
+):
+    m.ineq_pg_lb = pe.Constraint(index_set)
+
+    for g in index_set:
+        pmin = md.data['elements']['generator'][g]['p_min']
+        m.ineq_pg_lb[g] = pmin * m.gen_in_service_expr[g] <= m.pg[g]
+
+
+def declare_ineq_pg_ub(
+        m: _BlockData,
+        md: ModelData,
+        index_set: _SetData,
+):
+    m.ineq_pg_ub = pe.Constraint(index_set)
+
+    for g in index_set:
+        pmax = md.data['elements']['generator'][g]['p_max']
+        m.ineq_pg_ub[g] = pmax * m.gen_in_service_expr[g] >= m.pg[g]
+
+
+def declare_ineq_qg_lb(
+        m: _BlockData,
+        md: ModelData,
+        index_set: _SetData,
+):
+    m.ineq_qg_lb = pe.Constraint(index_set)
+
+    for g in index_set:
+        qmin = md.data['elements']['generator'][g]['q_min']
+        m.ineq_qg_lb[g] = qmin * m.gen_in_service_expr[g] <= m.qg[g]
+
+
+def declare_ineq_qg_ub(
+        m: _BlockData,
+        md: ModelData,
+        index_set: _SetData,
+):
+    m.ineq_qg_ub = pe.Constraint(index_set)
+
+    for g in index_set:
+        qmax = md.data['elements']['generator'][g]['q_max']
+        m.ineq_qg_ub[g] = qmax * m.gen_in_service_expr[g] >= m.qg[g]
 
 
 def pw_gen_generator(index_set, costs):
@@ -97,13 +205,13 @@ def declare_pg_delta_pg_con(model, index_set, p_costs):
                                                                 p_max=p_max,
                                                                 gen_name=gen_name)
         m.pg_delta_pg_con_set.add(gen_name)
-        lin_coefs = [-1]
-        lin_vars = [m.pg[gen_name]]
+        lin_coefs = []
+        lin_vars = []
         for ndx, ((o1, c1), (o2, c2)) in enumerate(zip(cleaned_values, cleaned_values[1:])):
             lin_coefs.append(1)
             lin_vars.append(m.delta_pg[gen_name, ndx])
         expr = LinearExpression(constant=cleaned_values[0][0], linear_coefs=lin_coefs, linear_vars=lin_vars)
-        m.pg_delta_pg_con[gen_name] = (expr, 0)
+        m.pg_delta_pg_con[gen_name] = m.pg[gen_name] == expr * m.gen_in_service_expr[gen_name]
 
 
 def declare_qg_delta_qg_con(model, index_set, q_costs):
@@ -121,13 +229,13 @@ def declare_qg_delta_qg_con(model, index_set, q_costs):
                                                                 p_max=q_max,
                                                                 gen_name=gen_name)
         m.qg_delta_qg_con_set.add(gen_name)
-        lin_coefs = [-1]
-        lin_vars = [m.qg[gen_name]]
+        lin_coefs = []
+        lin_vars = []
         for ndx, ((o1, c1), (o2, c2)) in enumerate(zip(cleaned_values, cleaned_values[1:])):
             lin_coefs.append(1)
             lin_vars.append(m.delta_qg[gen_name, ndx])
         expr = LinearExpression(constant=cleaned_values[0][0], linear_coefs=lin_coefs, linear_vars=lin_vars)
-        m.qg_delta_qg_con[gen_name] = (expr, 0)
+        m.qg_delta_qg_con[gen_name] = m.qg[gen_name] == expr * m.gen_in_service_expr[gen_name]
 
 
 def declare_var_pg_cost(model, index_set, p_costs):
@@ -144,7 +252,7 @@ def declare_var_qg_cost(model, index_set, q_costs):
     m.qg_cost = pe.Var(m.qg_cost_set)
 
 
-def _pw_cost_helper(cost_dict, cost_var, gen_var, pw_cost_set, gen_name, indexed_pw_cost_con):
+def _pw_cost_helper(cost_dict, cost_var, gen_var, pw_cost_set, gen_name, indexed_pw_cost_con, in_service_expr):
     if cost_dict['cost_curve_type'] == 'polynomial':
         pass
     elif cost_dict['cost_curve_type'] == 'piecewise':
@@ -158,11 +266,11 @@ def _pw_cost_helper(cost_dict, cost_var, gen_var, pw_cost_set, gen_name, indexed
                 slope = (cost2 - cost1) / (pt2 - pt1)
                 intercept = cost2 - slope * pt2
                 pw_cost_set.add((gen_name, ndx))
-                indexed_pw_cost_con[gen_name, ndx] = cost_var >= slope * gen_var + intercept
+                indexed_pw_cost_con[gen_name, ndx] = (None, (slope * gen_var + intercept) * in_service_expr - cost_var * in_service_expr, 0)
         else:
             intercept = cleaned_values[0][1]
             pw_cost_set.add((gen_name, 0))
-            indexed_pw_cost_con[gen_name, 0] = cost_var == intercept
+            indexed_pw_cost_con[gen_name, 0] = cost_var == intercept * in_service_expr
     else:
         raise ValueError(f"Unrecognized cost_curve_type: {cost_dict['cost_curve_type']}")
 
@@ -179,7 +287,8 @@ def declare_piecewise_pg_cost_cons(model, index_set, p_costs):
                         gen_var=m.pg[gen_name],
                         pw_cost_set=m.pg_piecewise_cost_set,
                         gen_name=gen_name,
-                        indexed_pw_cost_con=m.pg_piecewise_cost_cons)
+                        indexed_pw_cost_con=m.pg_piecewise_cost_cons,
+                        in_service_expr=m.gen_in_service_expr[gen_name])
 
 
 def declare_piecewise_qg_cost_cons(model, index_set, q_costs):
@@ -194,7 +303,8 @@ def declare_piecewise_qg_cost_cons(model, index_set, q_costs):
                         gen_var=m.qg[gen_name],
                         pw_cost_set=m.qg_piecewise_cost_set,
                         gen_name=gen_name,
-                        indexed_pw_cost_con=m.qg_piecewise_cost_cons)
+                        indexed_pw_cost_con=m.qg_piecewise_cost_cons,
+                        in_service_expr=m.gen_in_service_expr[gen_name])
 
 
 def declare_expression_pg_operating_cost(model, index_set, p_costs, pw_formulation='delta'):
@@ -210,7 +320,7 @@ def declare_expression_pg_operating_cost(model, index_set, p_costs, pw_formulati
     for gen_name in expr_set:
         if gen_name in p_costs:
             if p_costs[gen_name]['cost_curve_type'] == 'polynomial':
-                m.pg_operating_cost[gen_name] = sum(v*m.pg[gen_name]**i for i, v in p_costs[gen_name]['values'].items())
+                m.pg_operating_cost[gen_name] = sum(v*m.gen_in_service_expr[gen_name]*m.pg[gen_name]**i for i, v in p_costs[gen_name]['values'].items())
             elif p_costs[gen_name]['cost_curve_type'] == 'piecewise':
                 if pw_formulation == 'delta':
                     p_min = m.pg[gen_name].lb
@@ -226,9 +336,9 @@ def declare_expression_pg_operating_cost(model, index_set, p_costs, pw_formulati
                         for ndx, ((o1, c1), (o2, c2)) in enumerate(zip(cleaned_values, cleaned_values[1:])):
                             slope = (c2 - c1) / (o2 - o1)
                             expr += slope * m.delta_pg[gen_name, ndx]
-                    m.pg_operating_cost[gen_name] = expr
+                    m.pg_operating_cost[gen_name] = expr * m.gen_in_service_expr[gen_name]
                 else:
-                    m.pg_operating_cost[gen_name] = m.pg_cost[gen_name]
+                    m.pg_operating_cost[gen_name] = m.pg_cost[gen_name] * m.gen_in_service_expr[gen_name]
             else:
                 raise ValueError(f"Unrecognized cost_cureve_type: {p_costs[gen_name]['cost_curve_type']}")
         else:
@@ -248,7 +358,7 @@ def declare_expression_qg_operating_cost(model, index_set, q_costs, pw_formulati
     for gen_name in expr_set:
         if gen_name in q_costs:
             if q_costs[gen_name]['cost_curve_type'] == 'polynomial':
-                m.qg_operating_cost[gen_name] = sum(v*m.qg[gen_name]**i for i, v in q_costs[gen_name]['values'].items())
+                m.qg_operating_cost[gen_name] = sum(v*m.gen_in_service_expr[gen_name]*m.qg[gen_name]**i for i, v in q_costs[gen_name]['values'].items())
             elif q_costs[gen_name]['cost_curve_type'] == 'piecewise':
                 if pw_formulation == 'delta':
                     q_min = m.qg[gen_name].lb
@@ -263,9 +373,9 @@ def declare_expression_qg_operating_cost(model, index_set, q_costs, pw_formulati
                     for ndx, ((o1, c1), (o2, c2)) in enumerate(zip(cleaned_values, cleaned_values[1:])):
                         slope = (c2 - c1) / (o2 - o1)
                         expr += slope * m.delta_pg[gen_name, ndx]
-                    m.qg_operating_cost[gen_name] = expr
+                    m.qg_operating_cost[gen_name] = expr * m.gen_in_service_expr[gen_name]
                 else:
-                    m.qg_operating_cost[gen_name] = m.qg_cost[gen_name]
+                    m.qg_operating_cost[gen_name] = m.qg_cost[gen_name] * m.gen_in_service_expr[gen_name]
             else:
                 raise ValueError(f"Unrecognized cost_cureve_type: {q_costs[gen_name]['cost_curve_type']}")
         else:

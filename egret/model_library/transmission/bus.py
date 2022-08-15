@@ -12,9 +12,210 @@ This module contains the declarations for the modeling components
 typically used for buses (including loads and shunts)
 """
 import pyomo.environ as pe
+from pyomo.core.base.block import _BlockData
+from pyomo.core.base.set import _SetData
+from egret.data.model_data import ModelData
 import egret.model_library.decl as decl
 from egret.model_library.defn import FlowType, CoordinateType, ApproximationType
 from math import tan,  radians
+from typing import Optional
+
+
+def declare_set_bus_set(
+        m: _BlockData,
+        md: ModelData,
+):
+    buses = list(md.data['elements']['bus'].keys())
+    m.bus_set = pe.Set(initialize=buses)
+
+
+def declare_expression_p_balance_slack_expr(
+        m: _BlockData,
+        md: ModelData,
+        index_set: _SetData,
+        rule: Optional[str] = 'default'
+):
+    if rule not in {'default', None}:
+        raise ValueError("rule should be either 'default' or None")
+
+    m.p_balance_slack_expr = pe.Expression(index_set)
+
+    if rule == 'default':
+        for b in index_set:
+            m.p_balance_slack_expr[b] = 0
+
+
+def declare_expression_q_balance_slack_expr(
+        m: _BlockData,
+        md: ModelData,
+        index_set: _SetData,
+        rule: Optional[str] = 'default'
+):
+    if rule not in {'default', None}:
+        raise ValueError("rule should be either 'default' or None")
+
+    m.q_balance_slack_expr = pe.Expression(index_set)
+
+    if rule == 'default':
+        for b in index_set:
+            m.q_balance_slack_expr[b] = 0
+
+
+def declare_var_p_over_generation(
+        model: _BlockData,
+        md: ModelData,
+        index_set: _SetData,
+):
+    model.p_over_generation = pe.Var(index_set, initialize=0, bounds=(0, None))
+
+    ubs = dict()
+    for b in index_set:
+        ubs[b] = 0
+
+    for gname, gen in md.data['elements']['generator'].items():
+        bus_name = gen['bus']
+        if bus_name not in index_set:
+            continue
+        if gen['p_max'] > 0:
+            ubs[bus_name] += gen['p_max']
+
+    for lname, load in md.data['elements']['load'].items():
+        bus_name = load['bus']
+        if bus_name in index_set and 'p_load' in load:
+            if load['p_load'] < 0:
+                ubs[bus_name] -= load['p_load']
+
+    if 'shunt' in md.data['elements']:
+        for shunt_name, shunt in md.data['elements']['shunt'].items():
+            if shunt['shunt_type'] != 'fixed':
+                continue
+            if shunt['gs'] >= 0:
+                continue
+            bus_name = shunt['bus']
+            if bus_name not in index_set:
+                continue
+            ubs[bus_name] -= shunt['gs'] * md.data['elements']['bus'][bus_name]['v_max']**2
+
+    for b in index_set:
+        model.p_over_generation[b].setub(ubs[b])
+
+
+def declare_var_q_over_generation(
+        model: _BlockData,
+        md: ModelData,
+        index_set: _SetData,
+):
+    model.q_over_generation = pe.Var(index_set, initialize=0, bounds=(0, None))
+
+    ubs = dict()
+    for b in index_set:
+        ubs[b] = 0
+
+    for gname, gen in md.data['elements']['generator'].items():
+        bus_name = gen['bus']
+        if bus_name not in index_set:
+            continue
+        if gen['q_max'] > 0:
+            ubs[bus_name] += gen['q_max']
+
+    for lname, load in md.data['elements']['load'].items():
+        bus_name = load['bus']
+        if bus_name in index_set and 'q_load' in load:
+            if load['q_load'] < 0:
+                ubs[bus_name] -= load['q_load']
+
+    if 'shunt' in md.data['elements']:
+        for shunt_name, shunt in md.data['elements']['shunt'].items():
+            if shunt['shunt_type'] != 'fixed':
+                continue
+            if shunt['bs'] <= 0:
+                continue
+            bus_name = shunt['bus']
+            if bus_name not in index_set:
+                continue
+            ubs[bus_name] += shunt['bs'] * md.data['elements']['bus'][bus_name]['v_max']**2
+
+    for b in index_set:
+        model.q_over_generation[b].setub(ubs[b])
+
+
+def declare_var_p_load_shed(
+        model: _BlockData,
+        md: ModelData,
+        index_set: _SetData,
+):
+    model.p_load_shed = pe.Var(index_set, initialize=0, bounds=(0, None))
+
+    ubs = dict()
+    for b in index_set:
+        ubs[b] = 0
+
+    for gname, gen in md.data['elements']['generator'].items():
+        bus_name = gen['bus']
+        if bus_name not in index_set:
+            continue
+        if gen['p_min'] < 0:
+            ubs[bus_name] -= gen['p_min']
+
+    for lname, load in md.data['elements']['load'].items():
+        bus_name = load['bus']
+        if bus_name in index_set and 'p_load' in load:
+            if load['p_load'] > 0:
+                ubs[bus_name] += load['p_load']
+
+    if 'shunt' in md.data['elements']:
+        for shunt_name, shunt in md.data['elements']['shunt'].items():
+            if shunt['shunt_type'] != 'fixed':
+                continue
+            if shunt['gs'] <= 0:
+                continue
+            bus_name = shunt['bus']
+            if bus_name not in index_set:
+                continue
+            ubs[bus_name] += shunt['gs'] * md.data['elements']['bus'][bus_name]['v_max']**2
+
+    for b in index_set:
+        model.p_load_shed[b].setub(ubs[b])
+
+
+def declare_var_q_load_shed(
+        model: _BlockData,
+        md: ModelData,
+        index_set: _SetData,
+):
+    model.q_load_shed = pe.Var(index_set, initialize=0, bounds=(0, None))
+
+    ubs = dict()
+    for b in index_set:
+        ubs[b] = 0
+
+    for gname, gen in md.data['elements']['generator'].items():
+        bus_name = gen['bus']
+        if bus_name not in index_set:
+            continue
+        if gen['q_min'] < 0:
+            ubs[bus_name] -= gen['q_min']
+
+    for lname, load in md.data['elements']['load'].items():
+        bus_name = load['bus']
+        if bus_name in index_set and 'q_load' in load:
+            if load['q_load'] > 0:
+                ubs[bus_name] += load['q_load']
+
+    if 'shunt' in md.data['elements']:
+        for shunt_name, shunt in md.data['elements']['shunt'].items():
+            if shunt['shunt_type'] != 'fixed':
+                continue
+            if shunt['bs'] >= 0:
+                continue
+            bus_name = shunt['bus']
+            if bus_name not in index_set:
+                continue
+            ubs[bus_name] -= shunt['gs'] * md.data['elements']['bus'][bus_name]['v_max']**2
+
+    for b in index_set:
+        model.q_load_shed[b].setub(ubs[b])
+
 
 def declare_var_vr(model, index_set, **kwargs):
     """
@@ -60,11 +261,24 @@ def declare_expr_vmsq(model, index_set, coordinate_type=CoordinateType.POLAR):
             m.vmsq[bus] = m.vm[bus] ** 2
 
 
-def declare_var_vmsq(model, index_set, **kwargs):
+def declare_var_vmsq(
+        model: _BlockData,
+        md: ModelData,
+        index_set: _SetData,
+        add_bounds: bool = True,
+):
     """
     Create auxiliary variable for the voltage magnitude squared at a bus
     """
-    decl.declare_var('vmsq', model=model, index_set=index_set, **kwargs)
+    model.vmsq = pe.Var(index_set, initialize=1)
+
+    if add_bounds:
+        for bname in index_set:
+            bus = md.data['elements']['bus'][bname]
+            v_min = bus['v_min']
+            v_max = bus['v_max']
+            model.vmsq[bname].setlb(v_min**2)
+            model.vmsq[bname].setub(v_max**2)
 
 
 def declare_eq_vmsq(model, index_set, coordinate_type=CoordinateType.POLAR):
@@ -99,18 +313,51 @@ def declare_var_ij_aggregation_at_bus(model, index_set, **kwargs):
     decl.declare_var('ij_aggregation_at_bus', model=model, index_set=index_set, **kwargs)
 
 
-def declare_var_pl(model, index_set, **kwargs):
+def declare_var_pl(
+        model: _BlockData,
+        md: ModelData,
+        index_set: _SetData,
+        fix: bool = True,
+):
     """
     Create variable for the real power load at a bus
     """
-    decl.declare_var('pl', model=model, index_set=index_set, **kwargs)
+    model.pl = pe.Var(index_set)
+
+    for bname in index_set:
+        model.pl[bname].value = 0
+
+    for load_name, load in md.data['elements']['load'].items():
+        bus_name = load['bus']
+        if bus_name in index_set and 'p_load' in load:
+            model.pl[bus_name].value += load['p_load']
+
+    if fix:
+        model.pl.fix()
 
 
-def declare_var_ql(model, index_set, **kwargs):
+def declare_var_ql(
+        model: _BlockData,
+        md: ModelData,
+        index_set: _SetData,
+        fix: bool = True,
+):
     """
-    Create variable for the reactive power load at a bus
+    Create variable for the real power load at a bus
     """
-    decl.declare_var('ql', model=model, index_set=index_set, **kwargs)
+    model.ql = pe.Var(index_set)
+
+    for bname in index_set:
+        model.ql[bname].value = 0
+
+    for load_name, load in md.data['elements']['load'].items():
+        bus_name = load['bus']
+        if bus_name in index_set and 'q_load' in load:
+            model.ql[bus_name].value += load['q_load']
+
+    if fix:
+        model.ql.fix()
+
 
 def declare_var_p_nw(model, index_set, **kwargs):
     """
@@ -326,47 +573,86 @@ def declare_eq_p_balance_dc_approx(model, index_set,
             p_expr == 0.0
 
 
-def declare_eq_p_balance(model, index_set,
-                         bus_p_loads,
-                         gens_by_bus,
-                         bus_gs_fixed_shunts,
-                         inlet_branches_by_bus, outlet_branches_by_bus,
-                         **rhs_kwargs):
+def declare_eq_p_balance(
+        model: _BlockData,
+        md: ModelData,
+        index_set: _SetData,
+):
     """
     Create the equality constraints for the real power balance
     at a bus using the variables for real power flows, respectively.
 
     NOTE: Equation build orientates constants to the RHS in order to compute the correct dual variable sign
     """
-
     m = model
-    con_set = decl.declare_set('_con_eq_p_balance', model, index_set)
 
-    m.eq_p_balance = pe.Constraint(con_set)
+    exprs = dict()
+    for bus_name in index_set:
+        exprs[bus_name] = 0
 
-    for bus_name in con_set:
-        p_expr = -sum([m.pf[branch_name] for branch_name in outlet_branches_by_bus[bus_name]])
-        p_expr -= sum([m.pt[branch_name] for branch_name in inlet_branches_by_bus[bus_name]])
+    for branch_name, branch in md.data['elements']['branch'].items():
+        exprs[branch['from_bus']] -= m.pf[branch_name]
+        exprs[branch['to_bus']] -= m.pt[branch_name]
 
-        if bus_gs_fixed_shunts[bus_name] != 0.0:
-            vmsq = m.vmsq[bus_name]
-            p_expr -= bus_gs_fixed_shunts[bus_name] * vmsq
+    for gen_name, gen in md.data['elements']['generator'].items():
+        exprs[gen['bus']] += m.pg[gen_name] * m.gen_in_service_expr[gen_name]
 
-        if bus_p_loads[bus_name] != 0.0: # only applies to fixed loads, otherwise may cause an error
-            p_expr -= m.pl[bus_name]
+    for bus_name in index_set:
+        exprs[bus_name] -= m.pl[bus_name]
 
-        if rhs_kwargs:
-            for idx, val in rhs_kwargs.items():
-                if idx == 'include_feasibility_load_shed':
-                    p_expr += eval("m." + val)[bus_name]
-                if idx == 'include_feasibility_over_generation':
-                    p_expr -= eval("m." + val)[bus_name]
+    if 'shunt' in md.data['elements']:
+        for shunt_name, shunt in md.data['elements']['shunt'].items():
+            if shunt['shunt_type'] == 'fixed':
+                exprs[shunt['bus']] -= shunt['gs'] * m.vmsq[shunt['bus']]
 
-        for gen_name in gens_by_bus[bus_name]:
-            p_expr += m.pg[gen_name]
+    for bus_name in index_set:
+        exprs[bus_name] += m.p_balance_slack_expr[bus_name]
 
-        m.eq_p_balance[bus_name] = \
-            p_expr == 0.0
+    m.eq_p_balance = pe.Constraint(index_set)
+
+    for bus_name in index_set:
+        m.eq_p_balance[bus_name] = exprs[bus_name] == 0
+
+
+def declare_eq_q_balance(
+        model: _BlockData,
+        md: ModelData,
+        index_set: _SetData,
+):
+    """
+    Create the equality constraints for the reactive power balance
+    at a bus using the variables for reactive power flows.
+
+    NOTE: Equation build orientates constants to the RHS in order to compute the correct dual variable sign
+    """
+    m = model
+
+    exprs = dict()
+    for bus_name in index_set:
+        exprs[bus_name] = 0
+
+    for branch_name, branch in md.data['elements']['branch'].items():
+        exprs[branch['from_bus']] -= m.qf[branch_name]
+        exprs[branch['to_bus']] -= m.qt[branch_name]
+
+    for gen_name, gen in md.data['elements']['generator'].items():
+        exprs[gen['bus']] += m.qg[gen_name] * m.gen_in_service_expr[gen_name]
+
+    for bus_name in index_set:
+        exprs[bus_name] -= m.ql[bus_name]
+
+    if 'shunt' in md.data['elements']:
+        for shunt_name, shunt in md.data['elements']['shunt'].items():
+            if shunt['shunt_type'] == 'fixed':
+                exprs[shunt['bus']] += shunt['bs'] * m.vmsq[shunt['bus']]
+
+    for bus_name in index_set:
+        exprs[bus_name] += m.q_balance_slack_expr[bus_name]
+
+    m.eq_q_balance = pe.Constraint(index_set)
+
+    for bus_name in index_set:
+        m.eq_q_balance[bus_name] = exprs[bus_name] == 0
 
 
 def declare_eq_p_balance_with_i_aggregation(model, index_set,
@@ -403,48 +689,6 @@ def declare_eq_p_balance_with_i_aggregation(model, index_set,
 
         m.eq_p_balance[bus_name] = \
             p_expr == 0.0
-
-
-def declare_eq_q_balance(model, index_set,
-                         bus_q_loads,
-                         gens_by_bus,
-                         bus_bs_fixed_shunts,
-                         inlet_branches_by_bus, outlet_branches_by_bus,
-                         **rhs_kwargs):
-    """
-    Create the equality constraints for the reactive power balance
-    at a bus using the variables for reactive power flows, respectively.
-
-    NOTE: Equation build orientates constants to the RHS in order to compute the correct dual variable sign
-    """
-    m = model
-    con_set = decl.declare_set('_con_eq_q_balance', model, index_set)
-
-    m.eq_q_balance = pe.Constraint(con_set)
-
-    for bus_name in con_set:
-        q_expr = -sum([m.qf[branch_name] for branch_name in outlet_branches_by_bus[bus_name]])
-        q_expr -= sum([m.qt[branch_name] for branch_name in inlet_branches_by_bus[bus_name]])
-
-        if bus_bs_fixed_shunts[bus_name] != 0.0:
-            vmsq = m.vmsq[bus_name]
-            q_expr += bus_bs_fixed_shunts[bus_name] * vmsq
-
-        if bus_q_loads[bus_name] != 0.0: # only applies to fixed loads, otherwise may cause an error
-            q_expr -= m.ql[bus_name]
-
-        if rhs_kwargs:
-            for idx, val in rhs_kwargs.items():
-                if idx == 'include_feasibility_load_shed':
-                    q_expr += eval("m." + val)[bus_name]
-                if idx == 'include_feasibility_over_generation':
-                    q_expr -= eval("m." + val)[bus_name]
-
-        for gen_name in gens_by_bus[bus_name]:
-            q_expr += m.qg[gen_name]
-
-        m.eq_q_balance[bus_name] = \
-            q_expr == 0.0
 
 
 def declare_eq_q_balance_with_i_aggregation(model, index_set,
