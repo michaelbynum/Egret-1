@@ -218,18 +218,42 @@ def declare_var_q_load_shed(
         model.q_load_shed[b].setub(ubs[b])
 
 
-def declare_var_vr(model, index_set, **kwargs):
+def declare_var_vr(
+        model: _BlockData,
+        md: ModelData,
+        index_set: _SetData,
+        add_bounds: bool = True,
+):
     """
     Create variable for the real component of the voltage at a bus
     """
-    decl.declare_var('vr', model=model, index_set=index_set, **kwargs)
+    model.vr = pe.Var(index_set)
+
+    for b in index_set:
+        bus = md.data['elements']['bus'][b]
+        model.vr[b].value = bus['vm'] * math.cos(radians(bus['va']))
+        if add_bounds:
+            model.vr[b].setlb(-bus['v_max'])
+            model.vr[b].setub(bus['v_max'])
 
 
-def declare_var_vj(model, index_set, **kwargs):
+def declare_var_vj(
+        model: _BlockData,
+        md: ModelData,
+        index_set: _SetData,
+        add_bounds: bool = True,
+):
     """
     Create variable for the imaginary component of the voltage at a bus
     """
-    decl.declare_var('vj', model=model, index_set=index_set, **kwargs)
+    model.vj = pe.Var(index_set)
+
+    for b in index_set:
+        bus = md.data['elements']['bus'][b]
+        model.vj[b].value = bus['vm'] * math.sin(radians(bus['va']))
+        if add_bounds:
+            model.vj[b].setlb(-bus['v_max'])
+            model.vj[b].setub(bus['v_max'])
 
 
 def declare_var_vm(

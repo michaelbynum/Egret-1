@@ -189,23 +189,25 @@ def create_psv_acopf_model(
     return model, md
 
 
-def create_rsv_acopf_model(model_data, include_feasibility_slack=False, pw_cost_model='delta', keep_vars_for_out_of_service_elements=False):
-    model, md = _create_base_power_ac_model(model_data, include_feasibility_slack=include_feasibility_slack,
-                                            pw_cost_model=pw_cost_model, keep_vars_for_out_of_service_elements=keep_vars_for_out_of_service_elements)
-    bus_attrs = md.attributes(element_type='bus')
-    unique_bus_pairs = tx_utils.get_unique_bus_pairs(md)
+def create_rsv_acopf_model(
+        model_data: ModelData,
+        include_feasibility_slack: bool = False,
+        pw_cost_model: str = 'delta',
+        bound_all_vars: bool = False,
+) -> Tuple[_BlockData, ModelData]:
+    model, md = _create_base_power_ac_model(
+        model_data,
+        include_feasibility_slack=include_feasibility_slack,
+        pw_cost_model=pw_cost_model,
+        bound_all_vars=bound_all_vars,
+    )
 
-    # declare the rectangular voltages
-    neg_v_max = map_items(op.neg, bus_attrs['v_max'])
-    vr_init = {k: bus_attrs['vm'][k] * pe.cos(radians(bus_attrs['va'][k])) for k in bus_attrs['vm']}
-    libbus.declare_var_vr(model, bus_attrs['names'], initialize=vr_init,
-                          bounds=zip_items(neg_v_max, bus_attrs['v_max'])
-                          )
-
-    vj_init = {k: bus_attrs['vm'][k] * pe.sin(radians(bus_attrs['va'][k])) for k in bus_attrs['vm']}
-    libbus.declare_var_vj(model, bus_attrs['names'], initialize=vj_init,
-                          bounds=zip_items(neg_v_max, bus_attrs['v_max'])
-                          )
+    libbranch.declare_set_unique_bus_pairs(model, md)
+    libbus.declare_var_vr(model, md, model.bus_set, bound_all_vars)
+    libbus.declare_var_vj(model, md, model.bus_set, bound_all_vars)
+    libbus.declare_eq_vmsq(model, md, model.bus_set, CoordinateType.RECTANGULAR)
+    libbranch.declare_eq_c(model, md, model.unique_bus_pairs, CoordinateType.RECTANGULAR)
+    libbranch.declare_eq_s(model, md, model.unique_bus_pairs, CoordinateType.RECTANGULAR)
 
     # fix the reference bus
     ref_bus = md.data['system']['reference_bus']
@@ -214,18 +216,7 @@ def create_rsv_acopf_model(model_data, include_feasibility_slack=False, pw_cost_
         libbus.declare_eq_ref_bus_nonzero(model, ref_angle, ref_bus)
     else:
         model.vj[ref_bus].fix(0.0)
-        model.vr[ref_bus].setlb(bus_attrs['v_min'][ref_bus])
-
-    # relate c, s, and vmsq to vm and va
-    libbus.declare_eq_vmsq(model=model,
-                           index_set=bus_attrs['names'],
-                           coordinate_type=CoordinateType.RECTANGULAR)
-    libbranch.declare_eq_c(model=model,
-                           index_set=unique_bus_pairs,
-                           coordinate_type=CoordinateType.RECTANGULAR)
-    libbranch.declare_eq_s(model=model,
-                           index_set=unique_bus_pairs,
-                           coordinate_type=CoordinateType.RECTANGULAR)
+        model.vr[ref_bus].setlb(md.data['elements']['bus'][ref_bus]['v_min'])
 
     return model, md
 
