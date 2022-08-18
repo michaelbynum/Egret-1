@@ -25,7 +25,7 @@ from pyomo.contrib.fbbt.fbbt import fbbt
 from pyomo.core.base.block import _BlockData
 from pyomo.core.base.set import _SetData
 from typing import Mapping, Optional, Sequence
-from .tx_utils import get_unique_bus_pairs
+from .tx_utils import get_unique_bus_pairs, get_bus_to_branch_map
 from egret.data.networkx_utils import get_networkx_graph
 import warnings
 import networkx
@@ -34,6 +34,7 @@ from math import pi
 from typing import List, Tuple, AbstractSet
 from pyomo.contrib.fbbt import interval
 from pyomo.common.collections.orderedset import OrderedSet
+from pyomo.core.base.var import IndexedVar
 try:
     import coramin
     coramin_available = True
@@ -42,16 +43,6 @@ except ImportError:
 
 
 logger = logging.getLogger(__name__)
-
-
-def _get_bus_to_branch_map(md: ModelData):
-    bus_to_branch_map = dict()
-    for bname, branch in md.data['elements']['branch'].items():
-        from_bus = branch['from_bus']
-        to_bus = branch['to_bus']
-        if (from_bus, to_bus) not in bus_to_branch_map:
-            bus_to_branch_map[from_bus, to_bus] = bname
-    return bus_to_branch_map
 
 
 def declare_set_unique_bus_pairs(
@@ -77,14 +68,14 @@ def declare_set_cycle_basis_bus_pairs(
         for ndx in range(len(cycle) - 1):
             b1 = cycle[ndx]
             b2 = cycle[ndx + 1]
-            assert (b1, b2) in m.unique_bus_pairs or (b2, b1) in m.unique_bus_pairs
+            assert (b1, b2) in m.unique_bus_pairs != (b2, b1) in m.unique_bus_pairs
             if (b1, b2) in m.unique_bus_pairs:
                 cycle_basis_bus_pairs.add((b1, b2))
             else:
                 cycle_basis_bus_pairs.add((b2, b1))
         b1 = cycle[-1]
         b2 = cycle[0]
-        assert (b1, b2) in m.unique_bus_pairs or (b2, b1) in m.unique_bus_pairs
+        assert (b1, b2) in m.unique_bus_pairs != (b2, b1) in m.unique_bus_pairs
         if (b1, b2) in m.unique_bus_pairs:
             cycle_basis_bus_pairs.add((b1, b2))
         else:
@@ -141,8 +132,12 @@ def declare_var_dva(
             if (from_bus, to_bus) in index_set:
                 angle_min = max(-math.pi/2, math.radians(branch['angle_diff_min']))
                 angle_max = min(math.pi/2, math.radians(branch['angle_diff_max']))
-                model.dva.setlb(angle_min)
-                model.dva.setub(angle_max)
+                if model.dva[from_bus, to_bus].has_lb():
+                    angle_min = max(angle_min, model.dva[from_bus, to_bus].lb)
+                if model.dva[from_bus, to_bus].has_ub():
+                    angle_max = min(angle_max, model.dva[from_bus, to_bus].ub)
+                model.dva[from_bus, to_bus].setlb(angle_min)
+                model.dva[from_bus, to_bus].setub(angle_max)
 
 
 def declare_var_pfl(model, index_set, **kwargs):
@@ -357,7 +352,11 @@ def declare_eq_branch_dva(model, index_set, branches):
             m.va[from_bus] - m.va[to_bus] + shift
 
 
-def declare_eq_delta_va(model, index_set):
+def declare_eq_delta_va(
+        model: _BlockData,
+        md: ModelData,
+        index_set: _SetData
+):
     """
     Create the equality constraints for the angle difference
     in the branch
@@ -365,10 +364,9 @@ def declare_eq_delta_va(model, index_set):
     dva = va[from_bus] - va[to-bus]
     """
     m = model
-    con_set = decl.declare_set("_con_eq_delta_va_set", model, index_set)
-    m.eq_delta_va = pe.Constraint(con_set)
+    m.eq_delta_va = pe.Constraint(index_set)
 
-    for from_bus, to_bus in con_set:
+    for from_bus, to_bus in index_set:
         m.eq_delta_va[(from_bus, to_bus)] = m.dva[(from_bus, to_bus)] == m.va[from_bus] - m.va[to_bus]
 
 
@@ -512,60 +510,82 @@ def declare_duplicate_s_cons(
             seen_bus_pairs[from_bus, to_bus] = model.s[b]
 
 
-def declare_eq_c(model, index_set, coordinate_type=CoordinateType.POLAR):
+def declare_eq_c(
+        model: _BlockData,
+        md: ModelData,
+        index_set: _SetData,
+        coordinate_type=CoordinateType.POLAR
+):
     """
     Create a constraint relating c to the voltages
     """
     m = model
-    con_set = decl.declare_set('_con_eq_c', model, index_set)
-    m.eq_c = pe.Constraint(con_set)
+    m.eq_c = pe.Constraint(index_set)
 
-    if coordinate_type == CoordinateType.POLAR:
-        for from_bus, to_bus in con_set:
-            m.eq_c[(from_bus, to_bus)] = (m.c[(from_bus, to_bus)] ==
-                                          m.vm[from_bus] * m.vm[to_bus] * pe.cos(m.dva[(from_bus, to_bus)]))
-    elif coordinate_type == CoordinateType.RECTANGULAR:
-        for from_bus, to_bus in con_set:
-            m.eq_c[(from_bus, to_bus)] = (m.c[(from_bus, to_bus)] ==
-                                          m.vr[from_bus] * m.vr[to_bus] + m.vj[from_bus] * m.vj[to_bus])
-    else:
-        raise ValueError('unexpected coordinate_type: {0}'.format(str(coordinate_type)))
+    bus_to_branch_map = get_bus_to_branch_map(md)
+
+    seen_bus_pairs = set()
+
+    for from_bus, to_bus in index_set:
+        if (from_bus, to_bus) in seen_bus_pairs:
+            continue
+        if (to_bus, from_bus) in seen_bus_pairs:
+            continue
+        seen_bus_pairs.add((from_bus, to_bus))
+        branch_name = bus_to_branch_map[from_bus, to_bus]
+        if coordinate_type == CoordinateType.POLAR:
+            m.eq_c[(from_bus, to_bus)] = (
+                m.c[branch_name] == (
+                    m.vm[from_bus] * m.vm[to_bus] * pe.cos(m.dva[(from_bus, to_bus)])
+                )
+            )
+        elif coordinate_type == CoordinateType.RECTANGULAR:
+            m.eq_c[(from_bus, to_bus)] = (
+                m.c[branch_name] == (
+                    m.vr[from_bus] * m.vr[to_bus] + m.vj[from_bus] * m.vj[to_bus]
+                )
+            )
+        else:
+            raise ValueError('unexpected coordinate_type: {0}'.format(str(coordinate_type)))
 
 
 def declare_eq_s(
         model: _BlockData,
-        index_set,
-        branches: Mapping[str, Mapping],
+        md: ModelData,
+        index_set: _SetData,
         coordinate_type: CoordinateType = CoordinateType.POLAR
 ):
     """
     Create a constraint relating s to the voltages
     """
     m = model
-    con_set = decl.declare_set('_con_eq_s', model, index_set)
-    m.eq_s = pe.Constraint(con_set)
+    m.eq_s = pe.Constraint(index_set)
 
-    if coordinate_type == CoordinateType.POLAR:
-        for bname in con_set:
-            branch = branches[bname]
-            from_bus = branch['from_bus']
-            to_bus = branch['to_bus']
-            m.eq_s[bname] = (
-                m.s[bname] == (m.vm[from_bus] *
-                               m.vm[to_bus] *
-                               pe.sin(m.dva[(from_bus, to_bus)]))
+    bus_to_branch_map = get_bus_to_branch_map(md)
+
+    seen_bus_pairs = set()
+
+    for from_bus, to_bus in index_set:
+        if (from_bus, to_bus) in seen_bus_pairs:
+            continue
+        if (to_bus, from_bus) in seen_bus_pairs:
+            continue
+        seen_bus_pairs.add((from_bus, to_bus))
+        branch_name = bus_to_branch_map[from_bus, to_bus]
+        if coordinate_type == CoordinateType.POLAR:
+            m.eq_s[from_bus, to_bus] = (
+                m.s[branch_name] == (
+                    m.vm[from_bus] * m.vm[to_bus] * pe.sin(m.dva[(from_bus, to_bus)])
+                )
             )
-    elif coordinate_type == CoordinateType.RECTANGULAR:
-        for bname in con_set:
-            branch = branches[bname]
-            from_bus = branch['from_bus']
-            to_bus = branch['to_bus']
-            m.eq_s[bname] = (
-                m.s[bname] == (m.vj[from_bus] * m.vr[to_bus] -
-                               m.vr[from_bus] * m.vj[to_bus])
+        elif coordinate_type == CoordinateType.RECTANGULAR:
+            m.eq_s[from_bus, to_bus] = (
+                m.s[branch_name] == (
+                    m.vj[from_bus] * m.vr[to_bus] - m.vr[from_bus] * m.vj[to_bus]
+                )
             )
-    else:
-        raise ValueError('unexpected coordinate_type: {0}'.format(str(coordinate_type)))
+        else:
+            raise ValueError('unexpected coordinate_type: {0}'.format(str(coordinate_type)))
 
 
 def declare_eq_dva_arctan(
@@ -576,7 +596,7 @@ def declare_eq_dva_arctan(
     m = model
     m.eq_dva_arctan = pe.Constraint(index_set)
 
-    bus_to_branch_map = _get_bus_to_branch_map(md)
+    bus_to_branch_map = get_bus_to_branch_map(md)
 
     for from_bus, to_bus in index_set:
         svar = m.s[bus_to_branch_map[from_bus, to_bus]]
@@ -839,7 +859,7 @@ def declare_ineq_soc(
     """
     m = model
 
-    bus_to_branch_map = _get_bus_to_branch_map(md)
+    bus_to_branch_map = get_bus_to_branch_map(md)
 
     if not use_outer_approximation:
         m.ineq_soc = pe.Constraint(index_set)
@@ -889,7 +909,7 @@ def declare_ineq_soc_ub(
     """
     m = model
     m.ineq_soc_ub = pe.Constraint(index_set)
-    bus_to_branch_map = _get_bus_to_branch_map(md)
+    bus_to_branch_map = get_bus_to_branch_map(md)
     for from_bus, to_bus in index_set:
         branch_name = bus_to_branch_map[from_bus, to_bus]
         m.ineq_soc_ub[(from_bus, to_bus)] = (m.c[branch_name] ** 2 + m.s[branch_name] ** 2 >=

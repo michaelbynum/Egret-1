@@ -19,6 +19,7 @@ import egret.model_library.decl as decl
 from egret.model_library.defn import FlowType, CoordinateType, ApproximationType
 from math import tan,  radians
 from typing import Optional
+import math
 
 
 def declare_set_bus_set(
@@ -231,18 +232,41 @@ def declare_var_vj(model, index_set, **kwargs):
     decl.declare_var('vj', model=model, index_set=index_set, **kwargs)
 
 
-def declare_var_vm(model, index_set, **kwargs):
+def declare_var_vm(
+        model: _BlockData,
+        md: ModelData,
+        index_set: _SetData,
+        add_bounds: bool = True,
+):
     """
     Create variable for the voltage magnitude of the voltage at a bus
     """
-    decl.declare_var('vm', model=model, index_set=index_set, **kwargs)
+    model.vm = pe.Var(index_set, initialize=1)
+
+    if add_bounds:
+        for b in index_set:
+            bus = md.data['elements']['bus'][b]
+            model.vm[b].setlb(bus['v_min'])
+            model.vm[b].setub(bus['v_max'])
 
 
-def declare_var_va(model, index_set, **kwargs):
+def declare_var_va(
+        model: _BlockData,
+        md: ModelData,
+        index_set: _SetData,
+        add_bounds: bool = True,
+):
     """
     Create variable for the phase angle of the voltage at a bus
     """
-    decl.declare_var('va', model=model, index_set=index_set, **kwargs)
+    model.va = pe.Var(index_set)
+
+    for b in index_set:
+        bus = md.data['elements']['bus'][b]
+        model.va[b].value = radians(bus['va'])
+        if add_bounds:
+            model.va[b].setlb(-math.pi)
+            model.va[b].setub(math.pi)
 
 
 def declare_expr_vmsq(model, index_set, coordinate_type=CoordinateType.POLAR):
@@ -281,19 +305,23 @@ def declare_var_vmsq(
             model.vmsq[bname].setub(v_max**2)
 
 
-def declare_eq_vmsq(model, index_set, coordinate_type=CoordinateType.POLAR):
+def declare_eq_vmsq(
+        model: _BlockData,
+        md: ModelData,
+        index_set: _SetData,
+        coordinate_type=CoordinateType.POLAR
+):
     """
     Create a constraint relating vmsq to the voltages
     """
     m = model
-    con_set = decl.declare_set('_con_eq_vmsq', model, index_set)
-    m.eq_vmsq = pe.Constraint(con_set)
+    m.eq_vmsq = pe.Constraint(index_set)
 
     if coordinate_type == CoordinateType.POLAR:
-        for bus in con_set:
+        for bus in index_set:
             m.eq_vmsq[bus] = m.vmsq[bus] == m.vm[bus] ** 2
     elif coordinate_type == CoordinateType.RECTANGULAR:
-        for bus in con_set:
+        for bus in index_set:
             m.eq_vmsq[bus] = m.vmsq[bus] == m.vr[bus]**2 + m.vj[bus]**2
     else:
         raise ValueError('unexpected coordinate_type: {0}'.format(str(coordinate_type)))

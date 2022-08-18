@@ -19,16 +19,32 @@ import logging
 import copy
 from collections import OrderedDict
 from egret.data.data_utils import map_items, zip_items
+from pyomo.common.collections.orderedset import OrderedSet
+from egret.data.model_data import ModelData
+from typing import List, Tuple, Dict, Union
 
 
 logger = logging.getLogger(__name__)
 
 
-def get_unique_bus_pairs(md):
-    branch_attrs = md.attributes(element_type='branch')
-    bus_pairs = zip_items(branch_attrs['from_bus'], branch_attrs['to_bus'])
-    unique_bus_pairs = list(OrderedDict((val, None) for idx, val in bus_pairs.items()))
+def get_unique_bus_pairs(md) -> List[Tuple]:
+    unique_bus_pairs = OrderedSet()
+    for bname, branch in md.data['elements']['branch'].items():
+        from_bus = branch['from_bus']
+        to_bus = branch['to_bus']
+        unique_bus_pairs.add((from_bus, to_bus))
+    unique_bus_pairs = list(unique_bus_pairs)
     return unique_bus_pairs
+
+
+def get_bus_to_branch_map(md: ModelData) -> Dict[Tuple, Union[str, int]]:
+    bus_to_branch_map = dict()
+    for bname, branch in md.data['elements']['branch'].items():
+        from_bus = branch['from_bus']
+        to_bus = branch['to_bus']
+        if (from_bus, to_bus) not in bus_to_branch_map:
+            bus_to_branch_map[from_bus, to_bus] = bname
+    return bus_to_branch_map
 
 
 def _get_out_of_service_gens(md):
