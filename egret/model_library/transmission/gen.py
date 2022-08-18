@@ -135,7 +135,7 @@ def declare_ineq_qg_ub(
     m.ineq_qg_ub = pe.Constraint(index_set)
 
     for g in index_set:
-        qmax = md.data['elements']['generator'][g]['q_max']
+        qmax = md.data['elements']['generator'][g]['p_max']
         m.ineq_qg_ub[g] = qmax * m.gen_in_service_expr[g] >= m.qg[g]
 
 
