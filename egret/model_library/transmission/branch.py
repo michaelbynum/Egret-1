@@ -68,14 +68,14 @@ def declare_set_cycle_basis_bus_pairs(
         for ndx in range(len(cycle) - 1):
             b1 = cycle[ndx]
             b2 = cycle[ndx + 1]
-            assert (b1, b2) in m.unique_bus_pairs != (b2, b1) in m.unique_bus_pairs
+            assert ((b1, b2) in m.unique_bus_pairs) != ((b2, b1) in m.unique_bus_pairs)
             if (b1, b2) in m.unique_bus_pairs:
                 cycle_basis_bus_pairs.add((b1, b2))
             else:
                 cycle_basis_bus_pairs.add((b2, b1))
         b1 = cycle[-1]
         b2 = cycle[0]
-        assert (b1, b2) in m.unique_bus_pairs != (b2, b1) in m.unique_bus_pairs
+        assert ((b1, b2) in m.unique_bus_pairs) != ((b2, b1) in m.unique_bus_pairs)
         if (b1, b2) in m.unique_bus_pairs:
             cycle_basis_bus_pairs.add((b1, b2))
         else:
