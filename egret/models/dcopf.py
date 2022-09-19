@@ -21,6 +21,7 @@ import egret.model_library.transmission.branch as libbranch
 import egret.model_library.transmission.gen as libgen
 import egret.common.lazy_ptdf_utils as lpu
 import egret.data.ptdf_utils as ptdf_utils
+from egret.data.model_data import ModelData
 
 from egret.model_library.defn import CoordinateType, ApproximationType, BasePointType
 from egret.data.data_utils import map_items, zip_items
@@ -49,210 +50,75 @@ def _include_feasibility_slack(model, bus_names, bus_p_loads, gens_by_bus, gen_a
                     for bus_name in bus_names)
     return p_rhs_kwargs, penalty_expr
 
-def create_btheta_dcopf_model(model_data, include_angle_diff_limits=False, include_feasibility_slack=False, pw_cost_model='delta',
-                              keep_vars_for_out_of_service_elements=False):
-    if keep_vars_for_out_of_service_elements:
-        out_of_service_gens = tx_utils._get_out_of_service_gens(model_data)
-        out_of_service_branches = tx_utils._get_out_of_service_branches(model_data)
-    else:
-        out_of_service_gens = list()
-        out_of_service_branches = list()
-
-    md = model_data.clone_in_service()
-    tx_utils.scale_ModelData_to_pu(md, inplace = True)
-
-    gens = dict(md.elements(element_type='generator'))
-    buses = dict(md.elements(element_type='bus'))
-    branches = dict(md.elements(element_type='branch'))
-    loads = dict(md.elements(element_type='load'))
-    shunts = dict(md.elements(element_type='shunt'))
-
-    dc_branches = dict(md.elements(element_type='dc_branch'))
-
-    gen_attrs = md.attributes(element_type='generator')
-    bus_attrs = md.attributes(element_type='bus')
-    branch_attrs = md.attributes(element_type='branch')
-
-    inlet_branches_by_bus, outlet_branches_by_bus = \
-        tx_utils.inlet_outlet_branches_by_bus(branches, buses)
-    gens_by_bus = tx_utils.gens_by_bus(buses, gens)
+def create_btheta_dcopf_model(
+        model_data: ModelData,
+        include_angle_diff_limits: bool = False,
+        include_feasibility_slack: bool = False,
+        pw_cost_model: str = 'delta',
+):
+    md = model_data.clone()
+    tx_utils.scale_ModelData_to_pu(md, inplace=True)
 
     model = pe.ConcreteModel()
 
-    ### declare (and fix) the loads at the buses
-    bus_p_loads, _ = tx_utils.dict_of_bus_loads(buses, loads)
+    libbus.declare_set_bus_set(model, md)
+    libbranch.declare_set_branch_set(model, md)
+    libbranch.declare_set_dc_branch_set(model, md)
+    libgen.declare_set_gen_set(model, md)
+    libgen.declare_pw_p_cost_gen_set(model, md)
+    libgen.declare_poly_p_cost_gen_set(model, md)
 
-    libbus.declare_var_pl(model, bus_attrs['names'], initialize=bus_p_loads)
-    model.pl.fix()
+    libbranch.declare_expression_branch_in_service_expr(model, md, model.branch_set)
+    libgen.declare_expression_gen_in_service_expr(model, md, model.gen_set)
+    libbus.declare_expression_p_balance_slack_expr(model, md, model.bus_set)
 
-    ### declare the fixed shunts at the buses
-    _, bus_gs_fixed_shunts = tx_utils.dict_of_bus_fixed_shunts(buses, shunts)
+    libbus.declare_var_pl(model, md, model.bus_set, fix=True)
+    libbus.declare_var_va(model, md, model.bus_set, add_bounds=True)
+    libgen.declare_var_pg(model, md, model.gen_set, add_bounds=False)
+    libbranch.declare_var_pf(model, md,model.branch_set, add_bounds=True)
+    libbranch.declare_var_dcpf(model, md, model.dc_branch_set)
+    if pw_cost_model == 'delta':
+        libgen.declare_var_delta_pg(model=model, md=md, index_set=model.pw_p_cost_gen_set)
+    else:
+        libgen.declare_var_pg_cost(model, md, model.pw_p_cost_gen_set)
 
-    ### declare the polar voltages
-    va_bounds = {k: (-pi, pi) for k in bus_attrs['va']}
-    libbus.declare_var_va(model, bus_attrs['names'],
-                          initialize=tx_utils.radians_from_degrees_dict(bus_attrs['va']),
-                          bounds=va_bounds
-                          )
+    libgen.declare_ineq_pg_lb(model, md, model.gen_set)
+    libgen.declare_ineq_pg_ub(model, md, model.gen_set)
+    libbranch.declare_eq_branch_power_btheta_approx(
+        model, md, model.branch_set, approximation_type=ApproximationType.BTHETA
+    )
+    libbus.declare_eq_p_balance_dc_approx(model, md, model.bus_set, ApproximationType.BTHETA)
+    if include_angle_diff_limits:
+        libbranch.declare_ineq_angle_diff_branch_lbub(
+            model, md, model.branch_set, coordinate_type=CoordinateType.POLAR
+        )
+    if pw_cost_model == 'delta':
+        libgen.declare_pg_delta_pg_con(model, md, model.pw_p_cost_gen_set)
+    else:
+        libgen.declare_piecewise_pg_cost_cons(model, md, model.pw_p_cost_gen_set)
 
-    ### include the feasibility slack for the bus balances
-    p_rhs_kwargs = {}
-    penalty_expr = None
     if include_feasibility_slack:
-        p_marginal_slack_penalty = _validate_and_extract_slack_penalty(md)        
-        p_rhs_kwargs, penalty_expr = _include_feasibility_slack(model, bus_attrs['names'], bus_p_loads,
-                                                                gens_by_bus, gen_attrs, p_marginal_slack_penalty)
+        libbus.declare_var_p_load_shed(model, md, model.bus_set)
+        libbus.declare_var_p_over_generation(model, md, model.bus_set)
+        for b in model.bus_set:
+            model.p_balance_slack_expr[b] = model.p_load_shed[b] - model.p_over_generation[b]
 
-    ### fix the reference bus
+    # fix the reference bus
     ref_bus = md.data['system']['reference_bus']
     ref_angle = md.data['system']['reference_bus_angle']
     model.va[ref_bus].fix(radians(ref_angle))
 
-    ### declare the generator real power
-    pg_init = {k: (gen_attrs['p_min'][k] + gen_attrs['p_max'][k]) / 2.0 for k in gen_attrs['pg']}
-    libgen.declare_var_pg(model, gen_attrs['names'], initialize=pg_init,
-                          bounds=zip_items(gen_attrs['p_min'], gen_attrs['p_max'])
-                          )
-
-    ### declare the current flows in the branches
-    vr_init = {k: bus_attrs['vm'][k] * pe.cos(radians(bus_attrs['va'][k])) for k in bus_attrs['vm']}
-    vj_init = {k: bus_attrs['vm'][k] * pe.sin(radians(bus_attrs['va'][k])) for k in bus_attrs['vm']}
-    p_max = {k: branches[k]['rating_long_term'] for k in branches.keys()}
-    p_lbub = dict()
-    for k in branches.keys():
-        k_pmax = p_max[k]
-        if k_pmax is None:
-            p_lbub[k] = (None, None)
-        else:
-            p_lbub[k] = (-k_pmax,k_pmax)
-    pf_bounds = p_lbub
-    pf_init = dict()
-    for branch_name, branch in branches.items():
-        from_bus = branch['from_bus']
-        to_bus = branch['to_bus']
-        y_matrix = tx_calc.calculate_y_matrix_from_branch(branch)
-        ifr_init = tx_calc.calculate_ifr(vr_init[from_bus], vj_init[from_bus], vr_init[to_bus],
-                                         vj_init[to_bus], y_matrix)
-        ifj_init = tx_calc.calculate_ifj(vr_init[from_bus], vj_init[from_bus], vr_init[to_bus],
-                                         vj_init[to_bus], y_matrix)
-        pf_init[branch_name] = tx_calc.calculate_p(ifr_init, ifj_init, vr_init[from_bus], vj_init[from_bus])
-
-    libbranch.declare_var_pf(model=model,
-                             index_set=branch_attrs['names'],
-                             initialize=pf_init,
-                             bounds=pf_bounds
-                             )
-
-    if dc_branches:
-        dcpf_bounds = dict()
-        for k, k_dict in dc_branches.items():
-            kp_max = k_dict['rating_long_term']
-            if kp_max is None:
-                dcpf_bounds[k] = (None, None)
-            else:
-                dcpf_bounds[k] = (-kp_max, kp_max)
-        libbranch.declare_var_dcpf(model=model,
-                                   index_set=dc_branches.keys(),
-                                   initialize=0.,
-                                   bounds=dcpf_bounds,
-                                  )
-        dc_inlet_branches_by_bus, dc_outlet_branches_by_bus = \
-                tx_utils.inlet_outlet_branches_by_bus(dc_branches, buses)
-    else:
-        dc_inlet_branches_by_bus = None
-        dc_outlet_branches_by_bus = None
-
-
-    ### declare the branch power flow approximation constraints
-    libbranch.declare_eq_branch_power_btheta_approx(model=model,
-                                                    index_set=branch_attrs['names'],
-                                                    branches=branches
-                                                    )
-
-    ### declare the p balance
-    libbus.declare_eq_p_balance_dc_approx(model=model,
-                                          index_set=bus_attrs['names'],
-                                          bus_p_loads=bus_p_loads,
-                                          gens_by_bus=gens_by_bus,
-                                          bus_gs_fixed_shunts=bus_gs_fixed_shunts,
-                                          inlet_branches_by_bus=inlet_branches_by_bus,
-                                          outlet_branches_by_bus=outlet_branches_by_bus,
-                                          approximation_type=ApproximationType.BTHETA,
-                                          dc_inlet_branches_by_bus=dc_inlet_branches_by_bus,
-                                          dc_outlet_branches_by_bus=dc_outlet_branches_by_bus,
-                                          **p_rhs_kwargs
-                                          )
-
-    ### declare the real power flow limits
-    libbranch.declare_ineq_p_branch_thermal_lbub(model=model,
-                                                 index_set=branch_attrs['names'],
-                                                 branches=branches,
-                                                 p_thermal_limits=p_max,
-                                                 approximation_type=ApproximationType.BTHETA
-                                                 )
-
-    ### declare angle difference limits on interconnected buses
-    if include_angle_diff_limits:
-        libbranch.declare_ineq_angle_diff_branch_lbub(model=model,
-                                                      index_set=branch_attrs['names'],
-                                                      branches=branches,
-                                                      coordinate_type=CoordinateType.POLAR
-                                                      )
-
     # declare the generator cost objective
-    p_costs = gen_attrs['p_cost']
-    pw_pg_cost_gens = list(libgen.pw_gen_generator(gen_attrs['names'], costs=p_costs))
-    if len(pw_pg_cost_gens) > 0:
-        if pw_cost_model == 'delta':
-            libgen.declare_var_delta_pg(model=model, index_set=pw_pg_cost_gens, p_costs=p_costs)
-            libgen.declare_pg_delta_pg_con(model=model, index_set=pw_pg_cost_gens, p_costs=p_costs)
-        else:
-            libgen.declare_var_pg_cost(model=model, index_set=pw_pg_cost_gens, p_costs=p_costs)
-            libgen.declare_piecewise_pg_cost_cons(model=model, index_set=pw_pg_cost_gens, p_costs=p_costs)
-    libgen.declare_expression_pg_operating_cost(model=model, index_set=gen_attrs['names'], p_costs=p_costs, pw_formulation=pw_cost_model)
-    obj_expr = sum(model.pg_operating_cost[gen_name] for gen_name in model.pg_operating_cost)
+    libgen.declare_expression_pg_operating_cost(model, md, model.gen_set, pw_formulation=pw_cost_model)
+    obj_expr = sum(model.pg_operating_cost.values())
 
     if include_feasibility_slack:
-        obj_expr += penalty_expr
+        p_marginal_slack_penalty = _validate_and_extract_slack_penalty(md)
+        penalty_expr = sum(p_marginal_slack_penalty * (model.p_over_generation[bus_name] + model.p_load_shed[bus_name]) for bus_name in model.bus_set)
+        model.slack_penalty = pe.Expression(expr=penalty_expr)
+        obj_expr += model.slack_penalty
 
     model.obj = pe.Objective(expr=obj_expr)
-
-    out_of_service_gens_set = set(out_of_service_gens)
-
-    for gen_name, e in model.pg_operating_cost.items():
-        if gen_name in out_of_service_gens_set:
-            e.expr = 0
-
-    if len(pw_pg_cost_gens) > 0:
-        if pw_cost_model == 'delta':
-            for gen_name, ndx in model.delta_pg_set:
-                if gen_name in out_of_service_gens_set:
-                    model.delta_pg[gen_name, ndx].set_value(0, skip_validation=True)
-                    model.delta_pg[gen_name, ndx].fix()
-                    model.pg_delta_pg_con[gen_name].deactivate()
-        else:
-            for gen_name, ndx in model.pg_piecewise_cost_set:
-                if gen_name in out_of_service_gens_set:
-                    model.pg_cost[gen_name].set_value(0, skip_validation=True)
-                    model.pg_cost[gen_name].fix()
-                    model.pg_piecewise_cost_cons[gen_name, ndx].deactivate()
-
-    for gen_name in out_of_service_gens:
-        model.pg[gen_name].set_value(0, skip_validation=True)
-        model.pg[gen_name].fix()
-        model_data.data['elements']['generator'][gen_name]['in_service'] = False
-        md.data['elements']['generator'][gen_name]['in_service'] = False
-    for branch_name in out_of_service_branches:
-        model.pf[branch_name].set_value(0, skip_validation=True)
-        model.pf[branch_name].fix()
-        model.eq_pf_branch[branch_name].deactivate()
-        model.ineq_pf_branch_thermal_lb[branch_name].deactivate()
-        model.ineq_pf_branch_thermal_ub[branch_name].deactivate()
-        if include_angle_diff_limits:
-            model.ineq_angle_diff_branch_lb[branch_name].deactivate()
-            model.ineq_angle_diff_branch_ub[branch_name].deactivate()
-        model_data.data['elements']['branch'][branch_name]['in_service'] = False
-        md.data['elements']['branch'][branch_name]['in_service'] = False        
 
     return model, md
 

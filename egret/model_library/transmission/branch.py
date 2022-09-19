@@ -94,6 +94,17 @@ def declare_set_branch_set(
     m.branch_set = pe.Set(initialize=branches)
 
 
+def declare_set_dc_branch_set(
+        m: _BlockData,
+        md: ModelData,
+):
+    if 'dc_branch' in md.data['elements']:
+        dc_branches = list(md.data['elements']['dc_branch'].keys())
+    else:
+        dc_branches = list()
+    m.dc_branch_set = pe.Set(initialize=dc_branches)
+
+
 def declare_expression_branch_in_service_expr(
         m: _BlockData,
         md: ModelData,
@@ -286,11 +297,21 @@ def declare_var_pfi_slack_neg(model, index_set, **kwargs):
     decl.declare_var('pfi_slack_neg', model=model, index_set=index_set, **kwargs)
 
 
-def declare_var_dcpf(model, index_set, **kwargs):
+def declare_var_dcpf(
+        model: _BlockData,
+        md: ModelData,
+        index_set: _SetData):
     """
     Create the variable for the real power flow through a HVDC line
     """
-    decl.declare_var('dcpf', model=model, index_set=index_set, **kwargs)
+    model.dcpf = pe.Var(index_set, initialize=0)
+
+    for bname in index_set:
+        branch = md.data['elements']['dc_branch'][bname]
+        smax = branch['rating_long_term']
+        if smax is not None:
+            model.dcpf[bname].setlb(-smax)
+            model.dcpf[bname].setub(smax)
 
 
 def declare_var_ifr(model, index_set, **kwargs):
@@ -916,19 +937,21 @@ def declare_ineq_soc_ub(
                                              m.vmsq[from_bus] * m.vmsq[to_bus])
 
 
-def declare_eq_branch_power_btheta_approx(model, index_set, branches, approximation_type=ApproximationType.BTHETA):
+def declare_eq_branch_power_btheta_approx(
+        model: _BlockData,
+        md: ModelData,
+        index_set: _SetData,
+        approximation_type=ApproximationType.BTHETA
+):
     """
     Create the equality constraints for power (from BTHETA approximation)
     in the branch
     """
     m = model
 
-    con_set = decl.declare_set("_con_eq_branch_power_btheta_approx_set", model, index_set)
-
-
-    m.eq_pf_branch = pe.Constraint(con_set)
-    for branch_name in con_set:
-        branch = branches[branch_name]
+    m.eq_pf_branch = pe.Constraint(index_set)
+    for branch_name in index_set:
+        branch = md.data['elements']['branch'][branch_name]
 
         from_bus = branch['from_bus']
         to_bus = branch['to_bus']
@@ -944,10 +967,12 @@ def declare_eq_branch_power_btheta_approx(model, index_set, branches, approximat
             b = -1/(tau*x)
         elif approximation_type == ApproximationType.BTHETA_LOSSES:
             b = tx_calc.calculate_susceptance(branch)/tau
+        else:
+            raise ValueError(f'Unexpected approximation type: {approximation_type}')
 
-        m.eq_pf_branch[branch_name] = \
-            m.pf[branch_name] == \
-            b * (m.va[from_bus] - m.va[to_bus] + shift)
+        expr = b * (m.va[from_bus] - m.va[to_bus] + shift)
+        rhs = expr * m.branch_in_service_expr[branch_name]
+        m.eq_pf_branch[branch_name] = m.pf[branch_name] == rhs
 
 
 def declare_eq_branch_loss_btheta_approx(model, index_set, branches, relaxation_type = RelaxationType.NONE):
@@ -1549,8 +1574,8 @@ def declare_ineq_angle_diff_branch_lb_c_s(
             logger.warning(msg)
             warnings.warn(msg)
         clb[bname] = (
-                math.tan(angle_min) * m.c[bname] <=
-                m.s[bname] * m.branch_in_service_expr[bname]
+            (math.tan(angle_min) * m.c[bname] - m.s[bname])
+            * m.branch_in_service_expr[bname] <= 0
         )
 
 
@@ -1578,8 +1603,8 @@ def declare_ineq_angle_diff_branch_ub_c_s(
             logger.warning(msg)
             warnings.warn(msg)
         cub[bname] = (
-                m.s[bname] * m.branch_in_service_expr[bname] <=
-                math.tan(angle_max) * m.c[bname]
+            (m.s[bname] - math.tan(angle_max) * m.c[bname])
+            * m.branch_in_service_expr[bname] <= 0
         )
 
 
@@ -1596,48 +1621,59 @@ def declare_ineq_angle_diff_branch_lbub_c_s(
     declare_ineq_angle_diff_branch_ub_c_s(model, md, index_set)
 
 
-def declare_ineq_angle_diff_branch_lbub(model, index_set, branches, coordinate_type=CoordinateType.POLAR):
+def declare_ineq_angle_diff_branch_lbub(
+        model: _BlockData,
+        md: ModelData,
+        index_set: _SetData,
+        coordinate_type=CoordinateType.POLAR
+):
     """
     Create the inequality constraints for the angle difference
     bounds between interconnected buses.
     """
     m = model
-    con_set = decl.declare_set('_con_ineq_angle_diff_branch_lbub',
-                               model=model, index_set=index_set)
 
-    m.ineq_angle_diff_branch_lb = pe.Constraint(con_set)
-    m.ineq_angle_diff_branch_ub = pe.Constraint(con_set)
+    m.ineq_angle_diff_branch_lb = clb = pe.Constraint(index_set)
+    m.ineq_angle_diff_branch_ub = cub = pe.Constraint(index_set)
 
-    if coordinate_type == CoordinateType.POLAR:
-        for branch_name in con_set:
-            from_bus = branches[branch_name]['from_bus']
-            to_bus = branches[branch_name]['to_bus']
+    for branch_name in index_set:
+        branch = md.data['elements']['branch']
+        from_bus = branch['from_bus']
+        to_bus = branch['to_bus']
+        ang_min = math.radians(branch['angle_diff_min'])
+        ang_max = math.radians(branch['angle_diff_max'])
 
-            m.ineq_angle_diff_branch_lb[branch_name] = \
-                math.radians(branches[branch_name]['angle_diff_min']) <= m.va[from_bus] - m.va[to_bus]
-            m.ineq_angle_diff_branch_ub[branch_name] = \
-                m.va[from_bus] - m.va[to_bus] <= math.radians(branches[branch_name]['angle_diff_max'])
-    elif coordinate_type == CoordinateType.RECTANGULAR:
-        for branch_name in con_set:
-            from_bus = branches[branch_name]['from_bus']
-            to_bus = branches[branch_name]['to_bus']
-
-            if branches[branch_name]['angle_diff_min'] > -90:
-                if branches[branch_name]['angle_diff_min'] < -89:
-                    msg = 'angle difference limits larger than 89 will introduce large coefficients'
-                    logger.warning(msg)
-                    warnings.warn(msg)
-                m.ineq_angle_diff_branch_lb[branch_name] = (math.tan(math.radians(branches[branch_name]['angle_diff_min'])) *
-                                                            (m.vr[from_bus] * m.vr[to_bus] + m.vj[from_bus] * m.vj[to_bus]) <=
-                                                            m.vj[from_bus] * m.vr[to_bus] - m.vr[from_bus] * m.vj[to_bus])
-            if branches[branch_name]['angle_diff_max'] < 90:
-                if branches[branch_name]['angle_diff_min'] > 89:
-                    msg = 'angle difference limits larger than 89 will introduce large coefficients'
-                    logger.warning(msg)
-                    warnings.warn(msg)
-                m.ineq_angle_diff_branch_ub[branch_name] = (m.vj[from_bus] * m.vr[to_bus] - m.vr[from_bus] * m.vj[to_bus] <=
-                                                            math.tan(math.radians(branches[branch_name]['angle_diff_max'])) *
-                                                            (m.vr[from_bus] * m.vr[to_bus] + m.vj[from_bus] * m.vj[to_bus]))
+        if coordinate_type == CoordinateType.POLAR:
+            clb[branch_name] = (
+                (ang_min
+                 - m.va[from_bus]
+                 + m.va[to_bus]
+                 ) * m.branch_in_service_expr[branch_name] <= 0
+            )
+            cub[branch_name] = (
+                (m.va[from_bus]
+                 - m.va[to_bus]
+                 - ang_max
+                 ) * m.branch_in_service_expr[branch_name] <= 0
+            )
+        else:
+            assert coordinate_type == CoordinateType.RECTANGULAR
+            if -90 < branch['angle_diff_min'] < -89 or 89 < branch['angle_diff_max'] < 90:
+                msg = 'angle difference limits larger than 89 will introduce large coefficients'
+                logger.warning(msg)
+                warnings.warn(msg)
+            clb[branch_name] = (
+                    (math.tan(ang_min)
+                     * (m.vr[from_bus] * m.vr[to_bus] + m.vj[from_bus] * m.vj[to_bus])
+                     - (m.vj[from_bus] * m.vr[to_bus] - m.vr[from_bus] * m.vj[to_bus]))
+                    * m.branch_in_service_expr[branch_name] <= 0
+            )
+            cub[branch_name] = (
+                (m.vj[from_bus] * m.vr[to_bus] - m.vr[from_bus] * m.vj[to_bus]
+                 - math.tan(ang_max)
+                 * (m.vr[from_bus] * m.vr[to_bus] + m.vj[from_bus] * m.vj[to_bus]))
+                * m.branch_in_service_expr[branch_name] <= 0
+            )
 
 
 def declare_ineq_p_interface_bounds(model, index_set, interfaces,

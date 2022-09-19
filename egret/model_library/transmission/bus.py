@@ -565,64 +565,61 @@ def declare_eq_p_balance_ed(model, index_set, bus_p_loads, gens_by_bus, bus_gs_f
     else:
         m.eq_p_balance = pe.Constraint(expr = p_expr == 0.0)
 
-def declare_eq_p_balance_dc_approx(model, index_set,
-                                   bus_p_loads,
-                                   gens_by_bus,
-                                   bus_gs_fixed_shunts,
-                                   inlet_branches_by_bus, outlet_branches_by_bus,
-                                   approximation_type=ApproximationType.BTHETA,
-                                   dc_inlet_branches_by_bus=None,
-                                   dc_outlet_branches_by_bus=None,
-                                   **rhs_kwargs):
+def declare_eq_p_balance_dc_approx(
+        model: _BlockData,
+        md: ModelData,
+        index_set: _SetData,
+        approximation_type: ApproximationType = ApproximationType.BTHETA,
+):
     """
     Create the equality constraints for the real power balance
     at a bus using the variables for real power flows, respectively.
 
     NOTE: Equation build orientates constants to the RHS in order to compute the correct dual variable sign
     """
+    assert approximation_type in {ApproximationType.BTHETA,
+                                  ApproximationType.BTHETA_LOSSES}
     m = model
-    con_set = decl.declare_set('_con_eq_p_balance', model, index_set)
 
-    m.eq_p_balance = pe.Constraint(con_set)
+    exprs = dict()
+    for bus_name in index_set:
+        exprs[bus_name] = 0
 
-    for bus_name in con_set:
-        if approximation_type == ApproximationType.BTHETA:
-            p_expr = -sum(m.pf[branch_name] for branch_name in outlet_branches_by_bus[bus_name])
-            p_expr += sum(m.pf[branch_name] for branch_name in inlet_branches_by_bus[bus_name])
-        elif approximation_type == ApproximationType.BTHETA_LOSSES:
-            p_expr = -0.5*sum(m.pfl[branch_name] for branch_name in inlet_branches_by_bus[bus_name])
-            p_expr -= 0.5*sum(m.pfl[branch_name] for branch_name in outlet_branches_by_bus[bus_name])
-            p_expr -= sum(m.pf[branch_name] for branch_name in outlet_branches_by_bus[bus_name])
-            p_expr += sum(m.pf[branch_name] for branch_name in inlet_branches_by_bus[bus_name])
+    for branch_name in m.branch_set:
+        branch = md.data['elements']['branch'][branch_name]
+        exprs[branch['from_bus']] -= m.pf[branch_name]
+        exprs[branch['to_bus']] += m.pf[branch_name]
+    if approximation_type == ApproximationType.BTHETA_LOSSES:
+        for branch_name in m.branch_set:
+            branch = md.data['elements']['branch'][branch_name]
+            exprs[branch['from_bus']] -= 0.5 * m.pfl[branch_name]
+            exprs[branch['to_bus']] -= 0.5 * m.pfl[branch_name]
 
-        if dc_inlet_branches_by_bus is not None:
-            p_expr -= sum(m.dcpf[branch_name] for branch_name in dc_outlet_branches_by_bus[bus_name])
-            p_expr += sum(m.dcpf[branch_name] for branch_name in dc_inlet_branches_by_bus[bus_name])
+    for dc_bname in m.dc_branch_set:
+        dc_branch = md.data['elements']['dc_branch'][dc_bname]
+        exprs[dc_branch['from_bus']] -= m.dcpf[dc_bname]
+        exprs[dc_branch['to_bus']] += m.dcpf[dc_bname]
 
-        if bus_gs_fixed_shunts[bus_name] != 0.0:
-            p_expr -= bus_gs_fixed_shunts[bus_name]
+    if 'shunt' in md.data['elements']:
+        for shunt_name, shunt in md.data['elements']['shunt'].items():
+            if shunt['shunt_type'] == 'fixed':
+                if shunt['bus'] in index_set:
+                    exprs[shunt['bus']] -= shunt['gs']
 
-        if bus_p_loads[bus_name] != 0.0: # only applies to fixed loads, otherwise may cause an error
-            p_expr -= m.pl[bus_name]
+    for bus_name in index_set:
+        exprs[bus_name] -= m.pl[bus_name]
 
-        if rhs_kwargs:
-            k = bus_name
-            for idx, val in rhs_kwargs.items():
-                if isinstance(val, tuple):
-                    val,key = val
-                    k = (key,bus_name)
-                if not k in eval("m." + val).index_set():
-                    continue
-                if idx == 'include_feasibility_load_shed':
-                    p_expr += eval("m." + val)[k]
-                if idx == 'include_feasibility_over_generation':
-                    p_expr -= eval("m." + val)[k]
+    for bus_name in index_set:
+        exprs[bus_name] += m.p_balance_slack_expr[bus_name]
 
-        for gen_name in gens_by_bus[bus_name]:
-            p_expr += m.pg[gen_name]
+    for gen_name in m.gen_set:
+        gen = md.data['elements']['generator'][gen_name]
+        exprs[gen['bus']] += m.pg[gen_name] * m.gen_in_service_expr[gen_name]
 
-        m.eq_p_balance[bus_name] = \
-            p_expr == 0.0
+    m.eq_p_balance = pe.Constraint(index_set)
+
+    for bus_name in index_set:
+        m.eq_p_balance[bus_name] = exprs[bus_name] == 0
 
 
 def declare_eq_p_balance(
@@ -642,11 +639,13 @@ def declare_eq_p_balance(
     for bus_name in index_set:
         exprs[bus_name] = 0
 
-    for branch_name, branch in md.data['elements']['branch'].items():
+    for branch_name in m.branch_set:
+        branch = md.data['elements']['branch'][branch_name]
         exprs[branch['from_bus']] -= m.pf[branch_name]
         exprs[branch['to_bus']] -= m.pt[branch_name]
 
-    for gen_name, gen in md.data['elements']['generator'].items():
+    for gen_name in m.gen_set:
+        gen = md.data['elements']['generator'][gen_name]
         exprs[gen['bus']] += m.pg[gen_name] * m.gen_in_service_expr[gen_name]
 
     for bus_name in index_set:
@@ -655,7 +654,8 @@ def declare_eq_p_balance(
     if 'shunt' in md.data['elements']:
         for shunt_name, shunt in md.data['elements']['shunt'].items():
             if shunt['shunt_type'] == 'fixed':
-                exprs[shunt['bus']] -= shunt['gs'] * m.vmsq[shunt['bus']]
+                if shunt['bus'] in index_set:
+                    exprs[shunt['bus']] -= shunt['gs'] * m.vmsq[shunt['bus']]
 
     for bus_name in index_set:
         exprs[bus_name] += m.p_balance_slack_expr[bus_name]
