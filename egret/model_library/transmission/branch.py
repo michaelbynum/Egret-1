@@ -1317,10 +1317,10 @@ def declare_ineq_s_branch_current_limit(model, index_set,
 
         from_bus = branches[branch_name]['from_bus']
         to_bus = branches[branch_name]['to_bus']
-        m.ineq_sf_branch_thermal_limit[branch_name] = \
+        m.ineq_sf_branch_current_limit[branch_name] = \
             (m.vr[from_bus] ** 2 + m.vj[from_bus] ** 2) * (m.ifr[branch_name] ** 2 + m.ifj[branch_name] ** 2) \
             <= s_thermal_limits[branch_name] ** 2
-        m.ineq_st_branch_thermal_limit[branch_name] = \
+        m.ineq_st_branch_current_limit[branch_name] = \
             (m.vr[to_bus] ** 2 + m.vj[to_bus] ** 2) * (m.itr[branch_name] ** 2 + m.itj[branch_name] ** 2) \
             <= s_thermal_limits[branch_name] ** 2
 

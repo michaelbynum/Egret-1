@@ -40,7 +40,7 @@ def _create_base_power_ac_model(
     bound_all_vars: bool = False,
 ):
     # TODO: make sure loading results back into the ModelData object use
-    # the in_service expressionso
+    # the in_service expressions
 
     # TODO: test staleness of vars
     md = model_data.clone()
@@ -51,6 +51,10 @@ def _create_base_power_ac_model(
     libbus.declare_set_bus_set(model, md)
     libbranch.declare_set_branch_set(model, md)
     libgen.declare_set_gen_set(model, md)
+    libgen.declare_pw_p_cost_gen_set(model, md)
+    libgen.declare_poly_p_cost_gen_set(model, md)
+    libgen.declare_pw_q_cost_gen_set(model, md)
+    libgen.declare_poly_q_cost_gen_set(model, md)
 
     libbranch.declare_expression_branch_in_service_expr(model, md, model.branch_set)
     libgen.declare_expression_gen_in_service_expr(model, md, model.gen_set)
@@ -68,6 +72,12 @@ def _create_base_power_ac_model(
     libbranch.declare_var_pt(model=model, md=md, index_set=model.branch_set, add_bounds=bound_all_vars)
     libbranch.declare_var_qf(model=model, md=md, index_set=model.branch_set, add_bounds=bound_all_vars)
     libbranch.declare_var_qt(model=model, md=md, index_set=model.branch_set, add_bounds=bound_all_vars)
+    if pw_cost_model == 'delta':
+        libgen.declare_var_delta_pg(model=model, md=md, index_set=model.pw_p_cost_gen_set)
+        libgen.declare_var_delta_qg(model=model, md=md, index_set=model.pw_q_cost_gen_set)
+    else:
+        libgen.declare_var_pg_cost(model, md, model.pw_p_cost_gen_set)
+        libgen.declare_var_qg_cost(model, md, model.pw_q_cost_gen_set)
 
     libgen.declare_ineq_pg_lb(model, md, model.gen_set)
     libgen.declare_ineq_pg_ub(model, md, model.gen_set)
@@ -85,6 +95,12 @@ def _create_base_power_ac_model(
     libbranch.declare_ineq_st_branch_thermal_limit(model, md, model.branch_set)
     libbranch.declare_ineq_angle_diff_branch_lb_c_s(model, md, model.branch_set)
     libbranch.declare_ineq_angle_diff_branch_ub_c_s(model, md, model.branch_set)
+    if pw_cost_model == 'delta':
+        libgen.declare_pg_delta_pg_con(model, md, model.pw_p_cost_gen_set)
+        libgen.declare_qg_delta_qg_con(model, md, model.pw_q_cost_gen_set)
+    else:
+        libgen.declare_piecewise_pg_cost_cons(model, md, model.pw_p_cost_gen_set)
+        libgen.declare_piecewise_qg_cost_cons(model, md, model.pw_q_cost_gen_set)
 
     if include_feasibility_slack:
         libbus.declare_var_p_load_shed(model, md, model.bus_set)
@@ -94,39 +110,19 @@ def _create_base_power_ac_model(
         for b in model.bus_set:
             model.p_balance_slack_expr[b] = model.p_load_shed[b] - model.p_over_generation[b]
 
-    gen_attrs = md.attributes(element_type='generator')
+    libgen.declare_expression_pg_operating_cost(model, md, model.gen_set, pw_formulation=pw_cost_model)
+    libgen.declare_expression_qg_operating_cost(model, md, model.gen_set, pw_formulation=pw_cost_model)
 
-    # declare the generator cost objective
-    p_costs = gen_attrs['p_cost']
-    pw_pg_cost_gens = list(libgen.pw_gen_generator(gen_attrs['names'], costs=p_costs))
-    if len(pw_pg_cost_gens) > 0:
-        if pw_cost_model == 'delta':
-            libgen.declare_var_delta_pg(model=model, index_set=pw_pg_cost_gens, p_costs=p_costs)
-            libgen.declare_pg_delta_pg_con(model=model, index_set=pw_pg_cost_gens, p_costs=p_costs)
-        else:
-            libgen.declare_var_pg_cost(model=model, index_set=pw_pg_cost_gens, p_costs=p_costs)
-            libgen.declare_piecewise_pg_cost_cons(model=model, index_set=pw_pg_cost_gens, p_costs=p_costs)
-    libgen.declare_expression_pg_operating_cost(model=model, index_set=gen_attrs['names'], p_costs=p_costs, pw_formulation=pw_cost_model)
-    obj_expr = sum(model.pg_operating_cost[gen_name] for gen_name in model.pg_operating_cost)
-    q_costs = gen_attrs.get('q_cost', None)
-    if q_costs is not None:
-        pw_qg_cost_gens = list(libgen.pw_gen_generator(gen_attrs['names'], costs=q_costs))
-        if len(pw_qg_cost_gens) > 0:
-            if pw_cost_model == 'delta':
-                libgen.declare_var_delta_qg(model=model, index_set=pw_qg_cost_gens, q_costs=q_costs)
-                libgen.declare_qg_delta_qg_con(model=model, index_set=pw_qg_cost_gens, q_costs=q_costs)
-            else:
-                libgen.declare_var_qg_cost(model=model, index_set=pw_qg_cost_gens, q_costs=q_costs)
-                libgen.declare_piecewise_qg_cost_cons(model=model, index_set=pw_qg_cost_gens, q_costs=q_costs)
-        libgen.declare_expression_qg_operating_cost(model=model, index_set=gen_attrs['names'], q_costs=q_costs, pw_formulation=pw_cost_model)
-        obj_expr += sum(model.qg_operating_cost[gen_name] for gen_name in model.qg_operating_cost)
+    obj_expr = sum(model.pg_operating_cost.values())
+    obj_expr += sum(model.qg_operating_cost.values())
 
     if include_feasibility_slack:
         p_marginal_slack_penalty, q_marginal_slack_penalty = _validate_and_extract_slack_penalties(md)
         penalty_expr = sum(p_marginal_slack_penalty * (model.p_over_generation[bus_name] + model.p_load_shed[bus_name])
                            + q_marginal_slack_penalty * (model.q_over_generation[bus_name] + model.q_load_shed[bus_name])
                            for bus_name in model.bus_set)
-        obj_expr += penalty_expr
+        model.slack_penalty = pe.Expression(expr=penalty_expr)
+        obj_expr += model.slack_penalty
 
     model.obj = pe.Objective(expr=obj_expr)
 
@@ -139,13 +135,100 @@ def create_atan_acopf_model(
         pw_cost_model: str = 'delta',
         bound_all_vars: bool = False,
 ) -> Tuple[_BlockData, ModelData]:
-    model, md = _create_base_power_ac_model(
-        model_data,
-        include_feasibility_slack=include_feasibility_slack,
-        pw_cost_model=pw_cost_model,
-        bound_all_vars=bound_all_vars,
-    )
 
+    # we need a slight modification of the base model because the
+    # branch_in_service_expr changes the cycle basis; we need this to
+    # be immutable
+    md = model_data.clone()
+    tx_utils.scale_ModelData_to_pu(md, inplace=True)
+
+    model = pe.ConcreteModel()
+
+    libbus.declare_set_bus_set(model, md)
+    libbranch.declare_set_branch_set(model, md)
+    libgen.declare_set_gen_set(model, md)
+    libgen.declare_pw_p_cost_gen_set(model, md)
+    libgen.declare_poly_p_cost_gen_set(model, md)
+    libgen.declare_pw_q_cost_gen_set(model, md)
+    libgen.declare_poly_q_cost_gen_set(model, md)
+
+    in_service_dict = dict()
+    for branch_name, branch in md.data['elements']['branch'].items():
+        if branch['in_service']:
+            in_service_dict[branch_name] = 1
+        else:
+            in_service_dict[branch_name] = 0
+    model.branch_in_service_expr = pe.Param(model.branch_set, initialize=in_service_dict)
+    libgen.declare_expression_gen_in_service_expr(model, md, model.gen_set)
+    libbus.declare_expression_p_balance_slack_expr(model, md, model.bus_set)
+    libbus.declare_expression_q_balance_slack_expr(model, md, model.bus_set)
+
+    libbus.declare_var_vmsq(model=model, md=md, index_set=model.bus_set, add_bounds=True)
+    libbus.declare_var_pl(model=model, md=md, index_set=model.bus_set, fix=True)
+    libbus.declare_var_ql(model=model, md=md, index_set=model.bus_set, fix=True)
+    libgen.declare_var_pg(model=model, md=md, index_set=model.gen_set, add_bounds=False)
+    libgen.declare_var_qg(model=model, md=md, index_set=model.gen_set, add_bounds=False)
+    libbranch.declare_var_c(model=model, md=md, index_set=model.branch_set, add_bounds=bound_all_vars)
+    libbranch.declare_var_s(model=model, md=md, index_set=model.branch_set, add_bounds=bound_all_vars)
+    libbranch.declare_var_pf(model=model, md=md, index_set=model.branch_set, add_bounds=bound_all_vars)
+    libbranch.declare_var_pt(model=model, md=md, index_set=model.branch_set, add_bounds=bound_all_vars)
+    libbranch.declare_var_qf(model=model, md=md, index_set=model.branch_set, add_bounds=bound_all_vars)
+    libbranch.declare_var_qt(model=model, md=md, index_set=model.branch_set, add_bounds=bound_all_vars)
+    if pw_cost_model == 'delta':
+        libgen.declare_var_delta_pg(model=model, md=md, index_set=model.pw_p_cost_gen_set)
+        libgen.declare_var_delta_qg(model=model, md=md, index_set=model.pw_q_cost_gen_set)
+    else:
+        libgen.declare_var_pg_cost(model, md, model.pw_p_cost_gen_set)
+        libgen.declare_var_qg_cost(model, md, model.pw_q_cost_gen_set)
+
+    libgen.declare_ineq_pg_lb(model, md, model.gen_set)
+    libgen.declare_ineq_pg_ub(model, md, model.gen_set)
+    libgen.declare_ineq_qg_lb(model, md, model.gen_set)
+    libgen.declare_ineq_qg_ub(model, md, model.gen_set)
+    libbranch.declare_duplicate_c_cons(model, md, model.branch_set)
+    libbranch.declare_duplicate_s_cons(model, md, model.branch_set)
+    libbranch.declare_eq_pf_branch(model, md, model.branch_set)
+    libbranch.declare_eq_pt_branch(model, md, model.branch_set)
+    libbranch.declare_eq_qf_branch(model, md, model.branch_set)
+    libbranch.declare_eq_qt_branch(model, md, model.branch_set)
+    libbus.declare_eq_p_balance(model=model, md=md, index_set=model.bus_set)
+    libbus.declare_eq_q_balance(model=model, md=md, index_set=model.bus_set)
+    libbranch.declare_ineq_sf_branch_thermal_limit(model, md, model.branch_set)
+    libbranch.declare_ineq_st_branch_thermal_limit(model, md, model.branch_set)
+    libbranch.declare_ineq_angle_diff_branch_lb_c_s(model, md, model.branch_set)
+    libbranch.declare_ineq_angle_diff_branch_ub_c_s(model, md, model.branch_set)
+    if pw_cost_model == 'delta':
+        libgen.declare_pg_delta_pg_con(model, md, model.pw_p_cost_gen_set)
+        libgen.declare_qg_delta_qg_con(model, md, model.pw_q_cost_gen_set)
+    else:
+        libgen.declare_piecewise_pg_cost_cons(model, md, model.pw_p_cost_gen_set)
+        libgen.declare_piecewise_qg_cost_cons(model, md, model.pw_q_cost_gen_set)
+
+    if include_feasibility_slack:
+        libbus.declare_var_p_load_shed(model, md, model.bus_set)
+        libbus.declare_var_q_load_shed(model, md, model.bus_set)
+        libbus.declare_var_p_over_generation(model, md, model.bus_set)
+        libbus.declare_var_q_over_generation(model, md, model.bus_set)
+        for b in model.bus_set:
+            model.p_balance_slack_expr[b] = model.p_load_shed[b] - model.p_over_generation[b]
+
+    libgen.declare_expression_pg_operating_cost(model, md, model.gen_set, pw_formulation=pw_cost_model)
+    libgen.declare_expression_qg_operating_cost(model, md, model.gen_set, pw_formulation=pw_cost_model)
+
+    obj_expr = sum(model.pg_operating_cost.values())
+    obj_expr += sum(model.qg_operating_cost.values())
+
+    if include_feasibility_slack:
+        p_marginal_slack_penalty, q_marginal_slack_penalty = _validate_and_extract_slack_penalties(md)
+        penalty_expr = sum(p_marginal_slack_penalty * (model.p_over_generation[bus_name] + model.p_load_shed[bus_name])
+                           + q_marginal_slack_penalty * (model.q_over_generation[bus_name] + model.q_load_shed[bus_name])
+                           for bus_name in model.bus_set)
+        model.slack_penalty = pe.Expression(expr=penalty_expr)
+        obj_expr += model.slack_penalty
+
+    model.obj = pe.Objective(expr=obj_expr)
+
+    # specific to Arctan formulation
     libbranch.declare_set_unique_bus_pairs(model, md)
     cycle_basis = libbranch.declare_set_cycle_basis_bus_pairs(model, md)
     libbranch.declare_var_dva(model, md, model.cycle_basis_bus_pairs, bound_all_vars)
@@ -243,28 +326,28 @@ def create_riv_acopf_model(model_data, include_feasibility_slack=False, pw_cost_
 
     model = pe.ConcreteModel()
 
+    libbus.declare_set_bus_set(model, md)
+    libbranch.declare_set_branch_set(model, md)
+    libgen.declare_set_gen_set(model, md)
+    libgen.declare_pw_p_cost_gen_set(model, md)
+    libgen.declare_poly_p_cost_gen_set(model, md)
+    libgen.declare_pw_q_cost_gen_set(model, md)
+    libgen.declare_poly_q_cost_gen_set(model, md)
+
+    libgen.declare_expression_gen_in_service_expr(model, md, model.gen_set)
+
     ### declare (and fix) the loads at the buses
     bus_p_loads, bus_q_loads = tx_utils.dict_of_bus_loads(buses, loads)
 
-    libbus.declare_var_pl(model, bus_attrs['names'], initialize=bus_p_loads)
-    libbus.declare_var_ql(model, bus_attrs['names'], initialize=bus_q_loads)
-    model.pl.fix()
-    model.ql.fix()
+    libbus.declare_var_pl(model, md, bus_attrs['names'])
+    libbus.declare_var_ql(model, md, bus_attrs['names'])
 
     ### declare the fixed shunts at the buses
     bus_bs_fixed_shunts, bus_gs_fixed_shunts = tx_utils.dict_of_bus_fixed_shunts(buses, shunts)
 
     ### declare the rectangular voltages
-    neg_v_max = map_items(op.neg, bus_attrs['v_max'])
-    vr_init = {k: bus_attrs['vm'][k] * pe.cos(radians(bus_attrs['va'][k])) for k in bus_attrs['vm']}
-    libbus.declare_var_vr(model, bus_attrs['names'], initialize=vr_init,
-                          bounds=zip_items(neg_v_max, bus_attrs['v_max'])
-                          )
-
-    vj_init = {k: bus_attrs['vm'][k] * pe.sin(radians(bus_attrs['va'][k])) for k in bus_attrs['vm']}
-    libbus.declare_var_vj(model, bus_attrs['names'], initialize=vj_init,
-                          bounds=zip_items(neg_v_max, bus_attrs['v_max'])
-                          )
+    libbus.declare_var_vr(model, md, bus_attrs['names'], add_bounds=True)
+    libbus.declare_var_vj(model, md, bus_attrs['names'], add_bounds=True)
 
     ### include the feasibility slack for the bus balances
     p_rhs_kwargs = {}
@@ -287,15 +370,8 @@ def create_riv_acopf_model(model_data, include_feasibility_slack=False, pw_cost_
         model.vr[ref_bus].setlb(0.0)
 
     ### declare the generator real and reactive power
-    pg_init = {k: (gen_attrs['p_min'][k] + gen_attrs['p_max'][k]) / 2.0 for k in gen_attrs['pg']}
-    libgen.declare_var_pg(model, gen_attrs['names'], initialize=pg_init,
-                          bounds=zip_items(gen_attrs['p_min'], gen_attrs['p_max'])
-                          )
-
-    qg_init = {k: (gen_attrs['q_min'][k] + gen_attrs['q_max'][k]) / 2.0 for k in gen_attrs['qg']}
-    libgen.declare_var_qg(model, gen_attrs['names'], initialize=qg_init,
-                          bounds=zip_items(gen_attrs['q_min'], gen_attrs['q_max'])
-                          )
+    libgen.declare_var_pg(model, md, gen_attrs['names'], add_bounds=True)
+    libgen.declare_var_qg(model, md, gen_attrs['names'], add_bounds=True)
 
     ### declare the current flows in the branches
     branch_currents = tx_utils.dict_of_branch_currents(branches, buses)
@@ -306,6 +382,10 @@ def create_riv_acopf_model(model_data, include_feasibility_slack=False, pw_cost_
     ifj_init = dict()
     itr_init = dict()
     itj_init = dict()
+    vr_init = {k: bus_attrs['vm'][k] * pe.cos(radians(bus_attrs['va'][k])) for k in
+               bus_attrs['vm']}
+    vj_init = {k: bus_attrs['vm'][k] * pe.sin(radians(bus_attrs['va'][k])) for k in
+               bus_attrs['vm']}
     for branch_name, branch in branches.items():
         from_bus = branch['from_bus']
         to_bus = branch['to_bus']
@@ -409,7 +489,7 @@ def create_riv_acopf_model(model_data, include_feasibility_slack=False, pw_cost_
                                                    )
 
     ### declare the thermal limits
-    libbranch.declare_ineq_s_branch_thermal_limit(model=model,
+    libbranch.declare_ineq_s_branch_current_limit(model=model,
                                                   index_set=branch_attrs['names'],
                                                   branches=branches,
                                                   s_thermal_limits=s_max,
@@ -429,30 +509,22 @@ def create_riv_acopf_model(model_data, include_feasibility_slack=False, pw_cost_
                                                   branches=branches,
                                                   coordinate_type=CoordinateType.RECTANGULAR)
 
-    ### declare the generator cost objective
-    p_costs = gen_attrs['p_cost']
-    pw_pg_cost_gens = list(libgen.pw_gen_generator(gen_attrs['names'], costs=p_costs))
-    if len(pw_pg_cost_gens) > 0:
-        if pw_cost_model == 'delta':
-            libgen.declare_var_delta_pg(model=model, index_set=pw_pg_cost_gens, p_costs=p_costs)
-            libgen.declare_pg_delta_pg_con(model=model, index_set=pw_pg_cost_gens, p_costs=p_costs)
-        else:
-            libgen.declare_var_pg_cost(model=model, index_set=pw_pg_cost_gens, p_costs=p_costs)
-            libgen.declare_piecewise_pg_cost_cons(model=model, index_set=pw_pg_cost_gens, p_costs=p_costs)
-    libgen.declare_expression_pg_operating_cost(model=model, index_set=gen_attrs['names'], p_costs=p_costs, pw_formulation=pw_cost_model)
-    obj_expr = sum(model.pg_operating_cost[gen_name] for gen_name in model.pg_operating_cost)
-    q_costs = gen_attrs.get('q_cost', None)
-    if q_costs is not None:
-        pw_qg_cost_gens = list(libgen.pw_gen_generator(gen_attrs['names'], costs=q_costs))
-        if len(pw_qg_cost_gens) > 0:
-            if pw_cost_model == 'delta':
-                libgen.declare_var_delta_qg(model=model, index_set=pw_qg_cost_gens, q_costs=q_costs)
-                libgen.declare_qg_delta_qg_con(model=model, index_set=pw_qg_cost_gens, q_costs=q_costs)
-            else:
-                libgen.declare_var_qg_cost(model=model, index_set=pw_qg_cost_gens, q_costs=q_costs)
-                libgen.declare_piecewise_qg_cost_cons(model=model, index_set=pw_qg_cost_gens, q_costs=q_costs)
-        libgen.declare_expression_qg_operating_cost(model=model, index_set=gen_attrs['names'], q_costs=q_costs, pw_formulation=pw_cost_model)
-        obj_expr += sum(model.qg_operating_cost[gen_name] for gen_name in model.qg_operating_cost)
+    if pw_cost_model == 'delta':
+        libgen.declare_var_delta_pg(model=model, md=md, index_set=model.pw_p_cost_gen_set)
+        libgen.declare_var_delta_qg(model=model, md=md, index_set=model.pw_q_cost_gen_set)
+        libgen.declare_pg_delta_pg_con(model, md, model.pw_p_cost_gen_set)
+        libgen.declare_qg_delta_qg_con(model, md, model.pw_q_cost_gen_set)
+    else:
+        libgen.declare_var_pg_cost(model, md, model.pw_p_cost_gen_set)
+        libgen.declare_var_qg_cost(model, md, model.pw_q_cost_gen_set)
+        libgen.declare_piecewise_pg_cost_cons(model, md, model.pw_p_cost_gen_set)
+        libgen.declare_piecewise_qg_cost_cons(model, md, model.pw_q_cost_gen_set)
+
+    libgen.declare_expression_pg_operating_cost(model, md, model.gen_set, pw_formulation=pw_cost_model)
+    libgen.declare_expression_qg_operating_cost(model, md, model.gen_set, pw_formulation=pw_cost_model)
+
+    obj_expr = sum(model.pg_operating_cost.values())
+    obj_expr += sum(model.qg_operating_cost.values())
 
     if include_feasibility_slack:
         obj_expr += penalty_expr

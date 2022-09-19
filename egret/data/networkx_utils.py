@@ -5,6 +5,7 @@ from .data_utils import zip_items
 
 
 def get_networkx_graph(model_data: ModelData) -> networkx.Graph:
+    model_data = model_data.clone_in_service()
     graph = networkx.Graph()
     buses = dict(model_data.elements(element_type='bus'))
     branch_attrs = model_data.attributes(element_type='branch')
