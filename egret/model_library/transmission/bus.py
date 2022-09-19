@@ -582,7 +582,7 @@ def declare_eq_p_balance_dc_approx(
     m = model
 
     exprs = dict()
-    for bus_name in index_set:
+    for bus_name in md.data['elements']['bus'].keys():
         exprs[bus_name] = 0
 
     for branch_name in m.branch_set:

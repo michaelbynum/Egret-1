@@ -122,6 +122,7 @@ def create_btheta_dcopf_model(
 
     return model, md
 
+
 def create_ptdf_dcopf_model(model_data, include_feasibility_slack=False, base_point=BasePointType.FLATSTART, ptdf_options=None, pw_cost_model='delta'):
 
     ptdf_options = lpu.populate_default_ptdf_options(ptdf_options)
