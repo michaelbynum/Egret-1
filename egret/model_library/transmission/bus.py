@@ -636,7 +636,7 @@ def declare_eq_p_balance(
     m = model
 
     exprs = dict()
-    for bus_name in index_set:
+    for bus_name in m.bus_set:
         exprs[bus_name] = 0
 
     for branch_name in m.branch_set:
@@ -680,14 +680,16 @@ def declare_eq_q_balance(
     m = model
 
     exprs = dict()
-    for bus_name in index_set:
+    for bus_name in m.bus_set:
         exprs[bus_name] = 0
 
-    for branch_name, branch in md.data['elements']['branch'].items():
+    for branch_name in m.branch_set:
+        branch = md.data['elements']['branch'][branch_name]
         exprs[branch['from_bus']] -= m.qf[branch_name]
         exprs[branch['to_bus']] -= m.qt[branch_name]
 
-    for gen_name, gen in md.data['elements']['generator'].items():
+    for gen_name in m.gen_set:
+        gen = md.data['elements']['generator'][gen_name]
         exprs[gen['bus']] += m.qg[gen_name] * m.gen_in_service_expr[gen_name]
 
     for bus_name in index_set:
@@ -696,7 +698,8 @@ def declare_eq_q_balance(
     if 'shunt' in md.data['elements']:
         for shunt_name, shunt in md.data['elements']['shunt'].items():
             if shunt['shunt_type'] == 'fixed':
-                exprs[shunt['bus']] += shunt['bs'] * m.vmsq[shunt['bus']]
+                if shunt['bus'] in index_set:
+                    exprs[shunt['bus']] += shunt['bs'] * m.vmsq[shunt['bus']]
 
     for bus_name in index_set:
         exprs[bus_name] += m.q_balance_slack_expr[bus_name]
