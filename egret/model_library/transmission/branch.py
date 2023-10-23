@@ -125,6 +125,18 @@ def declare_expression_branch_in_service_expr(
                 m.branch_in_service_expr[b] = 0
 
 
+def declare_expr_dva(
+    model: _BlockData,
+    md: ModelData,
+    index_set: _SetData,      
+):
+    m = model
+    m.dva = pe.Expression(index_set)
+
+    for from_bus, to_bus in index_set:
+        m.dva[from_bus, to_bus] = m.va[from_bus] - m.va[to_bus]
+
+
 def declare_var_dva(
         model: _BlockData,
         md: ModelData,
@@ -159,6 +171,30 @@ def declare_var_pfl(model, index_set, **kwargs):
     decl.declare_var('pfl', model=model, index_set=index_set, **kwargs)
 
 
+def declare_expr_pf(
+        model: _BlockData,
+        md: ModelData,
+        index_set: _SetData,
+):
+    m = model
+    model.pf = pe.Expression(index_set)
+    for bname in index_set:
+        branch = md.data['elements']['branch'][bname]
+
+        from_bus = branch['from_bus']
+
+        g11, g12, g21, g22, b11, b12, b21, b22 = _get_branch_params(branch)
+
+        coefs = [g11, b21 - g12, -g21 - b12]
+        vlist = [
+            m.vmsq[from_bus],
+            m.c[bname],
+            m.s[bname],
+        ]
+        expr = sum(c*v for c, v in zip(coefs, vlist)) * m.branch_in_service_expr[bname]
+        m.pf[bname] = expr
+
+
 def declare_var_pf(
         model: _BlockData,
         md: ModelData,
@@ -178,6 +214,30 @@ def declare_var_pf(
             if smax is not None:
                 model.pf[bname].setlb(-smax)
                 model.pf[bname].setub(smax)
+
+
+def declare_expr_pt(
+        model: _BlockData,
+        md: ModelData,
+        index_set: _SetData,
+):
+    m = model
+    model.pt = pe.Expression(index_set)
+    for bname in index_set:
+        branch = md.data['elements']['branch'][bname]
+
+        to_bus = branch['to_bus']
+
+        g11, g12, g21, g22, b11, b12, b21, b22 = _get_branch_params(branch)
+
+        coefs = [g22, -g12 - b21, b12 - g21]
+        vlist = [
+            m.vmsq[to_bus],
+            m.c[bname],
+            m.s[bname],
+        ]
+        expr = sum(c*v for c, v in zip(coefs, vlist)) * m.branch_in_service_expr[bname]
+        m.pt[bname] = expr
 
 
 def declare_var_pt(
@@ -201,6 +261,30 @@ def declare_var_pt(
                 model.pt[bname].setub(smax)
 
 
+def declare_expr_qf(
+        model: _BlockData,
+        md: ModelData,
+        index_set: _SetData,
+):
+    m = model
+    model.qf = pe.Expression(index_set)
+    for bname in index_set:
+        branch = md.data['elements']['branch'][bname]
+
+        from_bus = branch['from_bus']
+
+        g11, g12, g21, g22, b11, b12, b21, b22 = _get_branch_params(branch)
+
+        coefs = [-b11, b12 + g21, b21 - g12]
+        vlist = [
+            m.vmsq[from_bus],
+            m.c[bname],
+            m.s[bname],
+        ]
+        expr = sum(c*v for c, v in zip(coefs, vlist)) * m.branch_in_service_expr[bname]
+        m.qf[bname] = expr
+
+
 def declare_var_qf(
         model: _BlockData,
         md: ModelData,
@@ -222,6 +306,30 @@ def declare_var_qf(
                 model.qf[bname].setub(smax)
 
 
+def declare_expr_qt(
+        model: _BlockData,
+        md: ModelData,
+        index_set: _SetData,
+):
+    m = model
+    model.qt = pe.Expression(index_set)
+    for bname in index_set:
+        branch = md.data['elements']['branch'][bname]
+
+        to_bus = branch['to_bus']
+
+        g11, g12, g21, g22, b11, b12, b21, b22 = _get_branch_params(branch)
+
+        coefs = [-b22, b12 - g21, b21 + g12]
+        vlist = [
+            m.vmsq[to_bus],
+            m.c[bname],
+            m.s[bname],
+        ]
+        expr = sum(c*v for c, v in zip(coefs, vlist)) * m.branch_in_service_expr[bname]
+        m.qt[bname] = expr
+
+
 def declare_var_qt(
         model: _BlockData,
         md: ModelData,
@@ -241,14 +349,6 @@ def declare_var_qt(
             if smax is not None:
                 model.qt[bname].setlb(-smax)
                 model.qt[bname].setub(smax)
-
-
-def declare_expr_pf(model, index_set, **kwargs):
-    """
-    Create expression for the real part of the power flow in the "from"
-    end of the transmission line
-    """
-    decl.declare_expr('pf', model=model, index_set=index_set, **kwargs)
 
 
 def declare_var_pf_slack_pos(model, index_set, **kwargs):
@@ -391,38 +491,48 @@ def declare_eq_delta_va(
         m.eq_delta_va[(from_bus, to_bus)] = m.dva[(from_bus, to_bus)] == m.va[from_bus] - m.va[to_bus]
 
 
-def declare_expr_c(model, index_set, coordinate_type=CoordinateType.POLAR):
+def declare_expr_c(
+        model: _BlockData,
+        md: ModelData, 
+        index_set: _SetData, 
+        coordinate_type=CoordinateType.POLAR):
     """
     Create expression for the nonlinear, nonconvex term based on cosine
     of the phase angle difference (polar) or bilinear voltages (rectangular)
     """
     m = model
-    expr_set = decl.declare_set('_expr_c', model, index_set)
-    m.c = pe.Expression(expr_set)
+    m.c = pe.Expression(index_set)
 
-    if coordinate_type == CoordinateType.RECTANGULAR:
-        for from_bus, to_bus in expr_set:
-            m.c[(from_bus,to_bus)] = m.vr[from_bus]*m.vr[to_bus] + m.vj[from_bus]*m.vj[to_bus]
-    elif coordinate_type == CoordinateType.POLAR:
-        for from_bus, to_bus in expr_set:
-            m.c[(from_bus,to_bus)] = m.vm[from_bus]*m.vm[to_bus]*pe.cos(m.va[from_bus]-m.va[to_bus])
+    for bname in index_set:
+        branch = md.data['elements']['branch'][bname]
+        from_bus = branch['from_bus']
+        to_bus = branch['to_bus']
+        if coordinate_type == CoordinateType.RECTANGULAR:
+                m.c[bname] = m.vr[from_bus]*m.vr[to_bus] + m.vj[from_bus]*m.vj[to_bus]
+        elif coordinate_type == CoordinateType.POLAR:
+            m.c[bname] = m.vm[from_bus]*m.vm[to_bus]*pe.cos(m.dva[(from_bus, to_bus)])
 
 
-def declare_expr_s(model, index_set, coordinate_type=CoordinateType.POLAR):
+def declare_expr_s(
+        model: _BlockData,
+        md: ModelData, 
+        index_set: _SetData, 
+        coordinate_type=CoordinateType.POLAR):
     """
     Create expression for the nonlinear, nonconvex term based on cosine
     of the phase angle difference (polar) or bilinear voltages (rectangular)
     """
     m = model
-    expr_set = decl.declare_set('_expr_s', model, index_set)
-    m.s = pe.Expression(expr_set)
+    m.s = pe.Expression(index_set)
 
-    if coordinate_type == CoordinateType.RECTANGULAR:
-        for from_bus, to_bus in expr_set:
-            m.s[(from_bus,to_bus)] = m.vj[from_bus]*m.vr[to_bus] - m.vr[from_bus]*m.vj[to_bus]
-    elif coordinate_type == CoordinateType.POLAR:
-        for from_bus, to_bus in expr_set:
-            m.s[(from_bus,to_bus)] = m.vm[from_bus]*m.vm[to_bus]*pe.sin(m.va[from_bus]-m.va[to_bus])
+    for bname in index_set:
+        branch = md.data['elements']['branch'][bname]
+        from_bus = branch['from_bus']
+        to_bus = branch['to_bus']
+        if coordinate_type == CoordinateType.RECTANGULAR:
+            m.s[bname] = m.vr=j[from_bus]*m.vr[to_bus] - m.vr[from_bus]*m.vj[to_bus]
+        elif coordinate_type == CoordinateType.POLAR:
+            m.s[bname] = m.vm[from_bus]*m.vm[to_bus]*pe.sin(m.dva[(from_bus, to_bus)])
 
 
 def declare_var_c(
@@ -757,11 +867,7 @@ def declare_eq_pf_branch(
             m.c[bname],
             m.s[bname],
         ]
-        expr = LinearExpression(
-            constant=0,
-            linear_coefs=coefs,
-            linear_vars=vlist,
-        )
+        expr = sum(c*v for c, v in zip(coefs, vlist))
         rhs = expr * m.branch_in_service_expr[bname]
         m.pf[bname].value = pe.value(rhs)
         m.eq_pf_branch[bname] = m.pf[bname] == rhs
@@ -786,11 +892,7 @@ def declare_eq_pt_branch(
             m.c[bname],
             m.s[bname],
         ]
-        expr = LinearExpression(
-            constant=0,
-            linear_coefs=coefs,
-            linear_vars=vlist,
-        )
+        expr = sum(c*v for c, v in zip(coefs, vlist))
         rhs = expr * m.branch_in_service_expr[bname]
         m.pt[bname].value = pe.value(rhs)
         m.eq_pt_branch[bname] = m.pt[bname] == rhs
@@ -815,11 +917,7 @@ def declare_eq_qf_branch(
             m.c[bname],
             m.s[bname],
         ]
-        expr = LinearExpression(
-            constant=0,
-            linear_coefs=coefs,
-            linear_vars=vlist,
-        )
+        expr = sum(c*v for c, v in zip(coefs, vlist))
         rhs = expr * m.branch_in_service_expr[bname]
         m.qf[bname].value = pe.value(rhs)
         m.eq_qf_branch[bname] = m.qf[bname] == rhs
@@ -844,11 +942,7 @@ def declare_eq_qt_branch(
             m.c[bname],
             m.s[bname],
         ]
-        expr = LinearExpression(
-            constant=0,
-            linear_coefs=coefs,
-            linear_vars=vlist,
-        )
+        expr = sum(c*v for c, v in zip(coefs, vlist))
         rhs = expr * m.branch_in_service_expr[bname]
         m.qt[bname].value = pe.value(rhs)
         m.eq_qt_branch[bname] = m.qt[bname] == rhs

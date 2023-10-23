@@ -293,20 +293,23 @@ def declare_var_va(
             model.va[b].setub(math.pi)
 
 
-def declare_expr_vmsq(model, index_set, coordinate_type=CoordinateType.POLAR):
-    """
-    Create an expression for the voltage magnitude squared at a bus
-    """
+def declare_expr_vmsq(
+        model: _BlockData,
+        md: ModelData,
+        index_set: _SetData,
+        coordinate_type=CoordinateType.POLAR,
+):
     m = model
-    expr_set = decl.declare_set('_expr_vmsq', model, index_set)
-    m.vmsq = pe.Expression(expr_set)
+    m.vmsq = pe.Expression(index_set)
 
-    if coordinate_type == CoordinateType.RECTANGULAR:
-        for bus in expr_set:
-            m.vmsq[bus] = m.vr[bus] ** 2 + m.vj[bus] ** 2
-    elif coordinate_type == CoordinateType.POLAR:
-        for bus in expr_set:
-            m.vmsq[bus] = m.vm[bus] ** 2
+    if coordinate_type == CoordinateType.POLAR:
+        for bname in index_set:
+            m.vmsq[bname] = m.vm[bname] ** 2
+    elif coordinate_type == CoordinateType.RECTANGULAR:
+        for bname in index_set:
+            m.vmsq[bname] = m.vr[bname]**2 + m.vj[bname]**2
+    else:
+        raise ValueError('unexpected coordinate_type: {0}'.format(str(coordinate_type)))
 
 
 def declare_var_vmsq(

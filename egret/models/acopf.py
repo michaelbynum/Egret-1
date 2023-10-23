@@ -272,6 +272,76 @@ def create_psv_acopf_model(
     return model, md
 
 
+def create_psv_acopf_model_no_extra_vars(
+        model_data: ModelData,
+) -> Tuple[_BlockData, ModelData]:
+    md = model_data.clone()
+    tx_utils.scale_ModelData_to_pu(md, inplace=True)
+
+    model = pe.ConcreteModel()
+    libbus.declare_set_bus_set(model, md)
+    libbranch.declare_set_branch_set(model, md)
+    libbranch.declare_set_unique_bus_pairs(model, md)
+    libgen.declare_set_gen_set(model, md)
+    libgen.declare_pw_p_cost_gen_set(model, md)
+    libgen.declare_poly_p_cost_gen_set(model, md)
+    libgen.declare_pw_q_cost_gen_set(model, md)
+    libgen.declare_poly_q_cost_gen_set(model, md)
+
+    libbranch.declare_expression_branch_in_service_expr(model, md, model.branch_set)
+    libgen.declare_expression_gen_in_service_expr(model, md, model.gen_set)
+    libbus.declare_expression_p_balance_slack_expr(model, md, model.bus_set)
+    libbus.declare_expression_q_balance_slack_expr(model, md, model.bus_set)
+
+    libbus.declare_var_vm(model, md, model.bus_set, add_bounds=True)
+    libbus.declare_var_va(model, md, model.bus_set, add_bounds=False)
+    libbus.declare_var_pl(model=model, md=md, index_set=model.bus_set, fix=True)
+    libbus.declare_var_ql(model=model, md=md, index_set=model.bus_set, fix=True)
+    libgen.declare_var_pg(model=model, md=md, index_set=model.gen_set, add_bounds=False)
+    libgen.declare_var_qg(model=model, md=md, index_set=model.gen_set, add_bounds=False)
+    
+    libbranch.declare_expr_dva(model, md, model.unique_bus_pairs)
+    libbranch.declare_expr_c(model, md, model.branch_set)
+    libbranch.declare_expr_s(model, md, model.branch_set)
+    libbus.declare_expr_vmsq(model, md, model.bus_set)
+    libbranch.declare_expr_pf(model, md, model.branch_set)
+    libbranch.declare_expr_pt(model, md, model.branch_set)
+    libbranch.declare_expr_qf(model, md, model.branch_set)
+    libbranch.declare_expr_qt(model, md, model.branch_set)
+
+    libgen.declare_var_delta_pg(model=model, md=md, index_set=model.pw_p_cost_gen_set)
+    libgen.declare_var_delta_qg(model=model, md=md, index_set=model.pw_q_cost_gen_set)
+
+    libgen.declare_ineq_pg_lb(model, md, model.gen_set)
+    libgen.declare_ineq_pg_ub(model, md, model.gen_set)
+    libgen.declare_ineq_qg_lb(model, md, model.gen_set)
+    libgen.declare_ineq_qg_ub(model, md, model.gen_set)
+
+    libbus.declare_eq_p_balance(model=model, md=md, index_set=model.bus_set)
+    libbus.declare_eq_q_balance(model=model, md=md, index_set=model.bus_set)
+    libbranch.declare_ineq_sf_branch_thermal_limit(model, md, model.branch_set)
+    libbranch.declare_ineq_st_branch_thermal_limit(model, md, model.branch_set)
+    libbranch.declare_ineq_angle_diff_branch_lb_c_s(model, md, model.branch_set)
+    libbranch.declare_ineq_angle_diff_branch_ub_c_s(model, md, model.branch_set)
+
+    libgen.declare_pg_delta_pg_con(model, md, model.pw_p_cost_gen_set)
+    libgen.declare_qg_delta_qg_con(model, md, model.pw_q_cost_gen_set)
+
+    libgen.declare_expression_pg_operating_cost(model, md, model.gen_set, pw_formulation='delta')
+    libgen.declare_expression_qg_operating_cost(model, md, model.gen_set, pw_formulation='delta')
+
+    obj_expr = sum(model.pg_operating_cost.values())
+    obj_expr += sum(model.qg_operating_cost.values())
+    model.obj = pe.Objective(expr=obj_expr)
+
+    # fix the reference bus
+    ref_bus = md.data['system']['reference_bus']
+    ref_angle = md.data['system']['reference_bus_angle']
+    model.va[ref_bus].fix(radians(ref_angle))
+
+    return model, md
+
+
 def create_rsv_acopf_model(
         model_data: ModelData,
         include_feasibility_slack: bool = False,
