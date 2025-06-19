@@ -102,7 +102,8 @@ def create_model_data_dict(rts_gmlc_dir:str,
 def parse_to_cache(rts_gmlc_dir:str, 
                    begin_time:Union[datetime,str],
                    end_time:Union[datetime,str],
-                   t0_state:Optional[dict]=None) -> ParsedCache:
+                   t0_state:Optional[dict]=None,
+                   honor_lookahead=True) -> ParsedCache:
     ''' Parse data in RTS-GMLC format, keeping the portions between a start and end time
 
     rts_gmlc_dir : str
@@ -127,7 +128,7 @@ def parse_to_cache(rts_gmlc_dir:str,
     model_data = _create_rtsgmlc_skeleton(rts_gmlc_dir)
 
     # Save the data frequencies
-    metadata_df = _read_metadata(rts_gmlc_dir)
+    metadata_df = _read_metadata(rts_gmlc_dir, honor_lookahead)
     minutes_per_period = {'DAY_AHEAD':int(metadata_df.loc['Period_Resolution', 'DAY_AHEAD'])//60,
                           'REAL_TIME':int(metadata_df.loc['Period_Resolution', 'REAL_TIME'])//60}
 
@@ -151,13 +152,17 @@ def parse_to_cache(rts_gmlc_dir:str,
                        timeseries_df, load_participation_factors, constant_reserve_data)
     
     
-def _read_metadata(base_dir:str) -> pd.DataFrame:
+def _read_metadata(base_dir:str, honor_lookahead:bool) -> pd.DataFrame:
     metadata_path = os.path.join(base_dir, "simulation_objects.csv")
     if not os.path.exists(metadata_path):
-        raise ValueError(f'RTS-GMLC directory "{base_dir}" does not contain expected CSV files.')
+        raise ValueError(f'RTS-GMLC directory "{rts_gmlc_dir}" does not contain expected CSV files.')
 
     # Read metadata about the data
     metadata_df = pd.read_csv(metadata_path, index_col=0)
+
+    if not honor_lookahead:
+        metadata_df.loc['Look_Ahead_Periods_per_Step']['DAY_AHEAD'] = 0
+        metadata_df.loc['Look_Ahead_Periods_per_Step']['REAL_TIME'] = 0
 
     return metadata_df
 
@@ -251,14 +256,12 @@ def _read_columnar_timeseries_file(file_name:str, minutes_per_period:int,
     The returned DataFrame converts the first 4 columns into a datetime which is used as
     the DataFrame's index.  All other CSV columns are included as columns in the DataFrame.
     """
-    _date_parser = lambda *columns: datetime(*map(int,columns[0:3])) + \
-                                    timedelta(minutes = minutes_per_period*(int(columns[3])-1))
-    df = pd.read_csv(file_name, 
-                     header=0, 
-                     parse_dates=[[0, 1, 2, 3]],
-                     date_parser=_date_parser,
-                     index_col=0)
+    df = pd.read_csv(file_name,
+                     header=0,
+                     parse_dates=[['Year', 'Month', 'Day']])
+    df.index = df['Year_Month_Day'] + pd.to_timedelta((df['Period']-1)*minutes_per_period, 'm')
     df.index.names = ['DateTime']
+    df.drop(['Year_Month_Day', 'Period'], axis=1, inplace=True)
 
     df.sort_index(inplace=True)
 
@@ -300,11 +303,9 @@ def _read_2D_timeseries_file(file_name:str, minutes_per_period:int,
     period is included in the results.  Like a typical python range, the returned data includes 
     the start_time but does not include the end_time.
     """
-    _date_parser = lambda *columns: datetime(*map(int,columns[0:3]))
     df = pd.read_csv(file_name, 
                      header=0, 
-                     parse_dates=[[0, 1, 2]],
-                     date_parser=_date_parser,
+                     parse_dates=[['Year', 'Month', 'Day']],
                      index_col=0)
     df.sort_index(inplace=True)
 
@@ -573,7 +574,7 @@ def _read_generators(base_dir:str, elements:dict, bus_id_to_name:dict) -> None:
 
         if fuel_field_count > 0:
             ## /1000. from the RTS-GMLC MATPOWER writer -- 
-            ## heat rates are in BTU/kWh, 1BTU == 10^-6 MMBTU, 1kWh == 10^-3 MWh, so MMBTU/MWh == 10^3/10^6 * BTU/kWh
+            ## heat rates are in BTU/kWh, 10^6 BTU == 1 MMBTU, 10^3 kWh == 1 MWh, so MMBTU/MWh == 10^3/10^6 * BTU/kWh
             f = {}
             f[0] = (float(row['HR_avg_0'])*1000./ 1000000.)*x[0]
             for i in range(1,fuel_field_count):
@@ -777,7 +778,8 @@ def _read_timeseries_data(model_data:dict, rts_gmlc_dir:str,
     # All timeseries data that has already been read (map[filename] -> DataFrame)
     timeseries_file_map = {}
 
-    timeseries_pointer_df = pd.read_csv(os.path.join(rts_gmlc_dir, "timeseries_pointers.csv"), header=0)
+    timeseries_pointer_df = pd.read_csv(os.path.join(rts_gmlc_dir, "timeseries_pointers.csv"), 
+                                        header=0, dtype={'Object':str})
 
     elements = model_data['elements']
     params_of_interest = {
@@ -786,9 +788,8 @@ def _read_timeseries_data(model_data:dict, rts_gmlc_dir:str,
         'Area':      {'MW Load'}
         }
 
-    # Add a column to timeseries DF to reference the parsed data 
-    # instead of the file name
-    timeseries_pointer_df['Series'] = None
+    # Create an array where we can gather parsed timeseries data
+    series_data = [None]*timeseries_pointer_df.shape[0]
 
     # Store the timeseries data in the timeseries DF
     for idx,row in timeseries_pointer_df.iterrows():
@@ -808,7 +809,7 @@ def _read_timeseries_data(model_data:dict, rts_gmlc_dir:str,
         is_reserve = (row['Category'] == 'Reserve')
         if is_reserve:
             # Skip unrecognized reserve names
-            name = str(row['Object'])
+            name = row['Object']
             if not is_valid_reserve_name(name, model_data):
                 continue
 
@@ -822,7 +823,10 @@ def _read_timeseries_data(model_data:dict, rts_gmlc_dir:str,
             timeseries_file_map[fname] = data
 
         # Save a reference to the relevant data as a Series
-        timeseries_pointer_df.at[idx,'Series'] = timeseries_file_map[fname][row['Object']]
+        series_data[idx]= timeseries_file_map[fname][row['Object']]
+
+    # Add the 'Series' column
+    timeseries_pointer_df = timeseries_pointer_df.assign(Series=series_data)
 
     # Remove columns that we don't want to preserve
     keepers= {'Simulation', 'Category', 'Object', 'Parameter', 'Series'}

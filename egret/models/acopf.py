@@ -23,8 +23,43 @@ from egret.model_library.defn import FlowType, CoordinateType
 from egret.data.model_data import ModelData
 from egret.data.data_utils import map_items, zip_items
 from math import pi, radians, degrees
-from pyomo.core.base.block import _BlockData
+from pyomo.core.base.block import BlockData
 from typing import Tuple
+from egret.common.fixed_vars import fix_var_and_remove_bounds
+
+
+def _include_feasibility_slack(model, bus_names, bus_p_loads, bus_q_loads,
+                               gens_by_bus, gen_attrs,
+                               p_marginal_slack_penalty, q_marginal_slack_penalty):
+    
+    import egret.model_library.decl as decl
+
+    p_over_gen_bounds = {k: (0, tx_utils.over_gen_limit(bus_p_loads[k], gens_by_bus[k], gen_attrs['p_max'])) for k in bus_names}
+    decl.declare_var('p_over_generation', model=model, index_set=bus_names,
+                     initialize=0., bounds=p_over_gen_bounds
+                     )
+
+    p_load_shed_bounds  = {k: (0, tx_utils.load_shed_limit(bus_p_loads[k], gens_by_bus[k], gen_attrs['p_min'])) for k in bus_names}
+    decl.declare_var('p_load_shed', model=model, index_set=bus_names,
+                     initialize=0., bounds=p_load_shed_bounds
+                     )
+
+    q_over_gen_bounds = {k: (0, tx_utils.over_gen_limit(bus_q_loads[k], gens_by_bus[k], gen_attrs['q_max'])) for k in bus_names}
+    decl.declare_var('q_over_generation', model=model, index_set=bus_names,
+                     initialize=0., bounds=q_over_gen_bounds
+                     )
+
+    q_load_shed_bounds  = {k: (0, tx_utils.load_shed_limit(bus_q_loads[k], gens_by_bus[k], gen_attrs['q_min'])) for k in bus_names}
+    decl.declare_var('q_load_shed', model=model, index_set=bus_names,
+                     initialize=0., bounds=q_load_shed_bounds
+                     )
+    p_rhs_kwargs = {'include_feasibility_load_shed':'p_load_shed', 'include_feasibility_over_generation':'p_over_generation'}
+    q_rhs_kwargs = {'include_feasibility_load_shed':'q_load_shed', 'include_feasibility_over_generation':'q_over_generation'}
+
+    penalty_expr = sum(p_marginal_slack_penalty * (model.p_over_generation[bus_name] + model.p_load_shed[bus_name])
+                     + q_marginal_slack_penalty * (model.q_over_generation[bus_name] + model.q_load_shed[bus_name])
+                    for bus_name in bus_names)
+    return p_rhs_kwargs, q_rhs_kwargs, penalty_expr
 
 
 def _validate_and_extract_slack_penalties(model_data):
@@ -134,7 +169,7 @@ def create_atan_acopf_model(
         include_feasibility_slack: bool = False,
         pw_cost_model: str = 'delta',
         bound_all_vars: bool = False,
-) -> Tuple[_BlockData, ModelData]:
+) -> Tuple[BlockData, ModelData]:
 
     # we need a slight modification of the base model because the
     # branch_in_service_expr changes the cycle basis; we need this to
@@ -245,7 +280,7 @@ def create_psv_acopf_model(
         include_feasibility_slack: bool = False,
         pw_cost_model: str = 'delta',
         bound_all_vars: bool = False,
-) -> Tuple[_BlockData, ModelData]:
+) -> Tuple[BlockData, ModelData]:
     model, md = _create_base_power_ac_model(
         model_data,
         include_feasibility_slack=include_feasibility_slack,
@@ -274,7 +309,7 @@ def create_psv_acopf_model(
 
 def create_psv_acopf_model_no_extra_vars(
         model_data: ModelData,
-) -> Tuple[_BlockData, ModelData]:
+) -> Tuple[BlockData, ModelData]:
     md = model_data.clone()
     tx_utils.scale_ModelData_to_pu(md, inplace=True)
 
@@ -347,7 +382,7 @@ def create_rsv_acopf_model(
         include_feasibility_slack: bool = False,
         pw_cost_model: str = 'delta',
         bound_all_vars: bool = False,
-) -> Tuple[_BlockData, ModelData]:
+) -> Tuple[BlockData, ModelData]:
     model, md = _create_base_power_ac_model(
         model_data,
         include_feasibility_slack=include_feasibility_slack,

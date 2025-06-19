@@ -30,6 +30,7 @@ from egret.models.copperplate_dispatch import (_include_system_feasibility_slack
                                                create_copperplate_dispatch_approx_model)
 from egret.common.log import logger
 from math import pi, radians, degrees
+from .fixed_vars import fix_var_and_remove_bounds
 
 
 def _include_feasibility_slack(model, bus_names, bus_p_loads, gens_by_bus, gen_attrs, p_marginal_slack_penalty):
@@ -157,7 +158,8 @@ def create_ptdf_dcopf_model(model_data, include_feasibility_slack=False, base_po
     bus_p_loads, _ = tx_utils.dict_of_bus_loads(buses, loads)
 
     libbus.declare_var_pl(model, buses_idx, initialize=bus_p_loads)
-    model.pl.fix()
+    for k, v in model.pl.items():
+        fix_var_and_remove_bounds(v, v.value)
 
     ### declare the fixed shunts at the buses
     _, bus_gs_fixed_shunts = tx_utils.dict_of_bus_fixed_shunts(buses, shunts)
