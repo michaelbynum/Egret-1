@@ -20,6 +20,7 @@ from egret.model_library.defn import FlowType, CoordinateType, ApproximationType
 from math import tan,  radians
 from typing import Optional
 import math
+from egret.common.fixed_vars import fix_var_and_remove_bounds
 
 
 def declare_set_bus_set(
@@ -388,7 +389,8 @@ def declare_var_pl(
             model.pl[bus_name].value += load['p_load']
 
     if fix:
-        model.pl.fix()
+        for k, v in model.pl.items():
+            fix_var_and_remove_bounds(v, v.value)
 
 
 def declare_var_ql(
@@ -411,7 +413,8 @@ def declare_var_ql(
             model.ql[bus_name].value += load['q_load']
 
     if fix:
-        model.ql.fix()
+        for k, v in model.ql.items():
+            fix_var_and_remove_bounds(v, v.value)
 
 
 def declare_var_p_nw(model, index_set, **kwargs):
