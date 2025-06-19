@@ -30,7 +30,7 @@ from egret.models.copperplate_dispatch import (_include_system_feasibility_slack
                                                create_copperplate_dispatch_approx_model)
 from egret.common.log import logger
 from math import pi, radians, degrees
-from .fixed_vars import fix_var_and_remove_bounds
+from egret.common.fixed_vars import fix_var_and_remove_bounds
 
 
 def _include_feasibility_slack(model, bus_names, bus_p_loads, gens_by_bus, gen_attrs, p_marginal_slack_penalty):
