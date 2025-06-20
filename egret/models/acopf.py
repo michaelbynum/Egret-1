@@ -610,8 +610,8 @@ def create_riv_acopf_model(model_data, include_feasibility_slack=False, pw_cost_
 
     ### declare angle difference limits on interconnected buses
     libbranch.declare_ineq_angle_diff_branch_lbub(model=model,
+                                                  md=md,
                                                   index_set=branch_attrs['names'],
-                                                  branches=branches,
                                                   coordinate_type=CoordinateType.RECTANGULAR)
 
     if pw_cost_model == 'delta':

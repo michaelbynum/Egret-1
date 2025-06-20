@@ -1728,7 +1728,7 @@ def declare_ineq_angle_diff_branch_lbub(
     m.ineq_angle_diff_branch_ub = cub = pe.Constraint(index_set)
 
     for branch_name in index_set:
-        branch = md.data['elements']['branch']
+        branch = md.data['elements']['branch'][branch_name]
         from_bus = branch['from_bus']
         to_bus = branch['to_bus']
         ang_min = math.radians(branch['angle_diff_min'])
